@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 from .const import CONF_ENCRYPTION_KEY, DOMAIN
 from .coordinator import OpenDisplayCoordinator
+from .designer import async_setup_designer
 from .services import async_setup_services
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -75,6 +76,7 @@ def _get_encryption_key(entry: OpenDisplayConfigEntry) -> bytes | None:
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the OpenDisplay integration."""
     async_setup_services(hass)
+    await async_setup_designer(hass)
     return True
 
 

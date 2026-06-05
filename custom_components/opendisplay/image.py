@@ -10,6 +10,10 @@ import homeassistant.util.dt as dt_util
 from . import OpenDisplayConfigEntry
 from .const import SIGNAL_IMAGE_UPDATED
 from .coordinator import OpenDisplayCoordinator
+from .designer.image_entity import (
+    designer_extra_state_attributes,
+    designer_on_entity_added,
+)
 
 PARALLEL_UPDATES = 0
 
@@ -20,7 +24,9 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the OpenDisplay image entity."""
-    async_add_entities([OpenDisplayImageEntity(hass, entry.runtime_data.coordinator)])
+    async_add_entities(
+        [OpenDisplayImageEntity(hass, entry.runtime_data.coordinator, entry)]
+    )
 
 
 class OpenDisplayImageEntity(ImageEntity):
@@ -30,10 +36,16 @@ class OpenDisplayImageEntity(ImageEntity):
     _attr_translation_key = "content"
     _attr_content_type = "image/jpeg"
 
-    def __init__(self, hass: HomeAssistant, coordinator: OpenDisplayCoordinator) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: OpenDisplayCoordinator,
+        entry: OpenDisplayConfigEntry | None = None,
+    ) -> None:
         """Initialize the image entity."""
         super().__init__(hass)
         self._coordinator = coordinator
+        self._designer_entry = entry
         self._attr_unique_id = f"{coordinator.address}-display_content"
         self._attr_device_info = DeviceInfo(
             connections={(CONNECTION_BLUETOOTH, coordinator.address)},
@@ -54,6 +66,7 @@ class OpenDisplayImageEntity(ImageEntity):
                 self._handle_image_update,
             )
         )
+        await designer_on_entity_added(self, self._designer_entry)
 
     @callback
     def _handle_image_update(self, image_bytes: bytes) -> None:
@@ -61,3 +74,8 @@ class OpenDisplayImageEntity(ImageEntity):
         self._image_bytes = image_bytes
         self._attr_image_last_updated = dt_util.utcnow()
         self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose display capabilities for the designer."""
+        return designer_extra_state_attributes(self, self._designer_entry)
