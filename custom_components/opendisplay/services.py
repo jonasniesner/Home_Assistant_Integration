@@ -83,12 +83,14 @@ from .const import (
 from .delivery import DELIVERY_DEADLINE_S, DeliveryReceipt
 from .refresh_modes import (
     REFRESH_MODE_BY_NAME,
+    STOCK_MODE_INDEX,
     DriveRequest,
     RefreshModeError,
     async_drive_upload,
     display_modes,
     experimental_enabled,
     frame_codes,
+    full_keeps_prior,
     record_plain_upload,
     resolve_mode,
     stock_mode,
@@ -686,7 +688,15 @@ async def _async_send_image(
     )
     if drive_mode is not None and not uses_drive_write(drive_mode):
         refresh_mode = REFRESH_MODE_BY_NAME.get(drive_mode.name.lower(), refresh_mode)
-        drive_mode = None
+        keep = (
+            drive_mode.mode_index == STOCK_MODE_INDEX
+            and refresh_mode is RefreshMode.FULL
+            and not tone
+            and not refine_dithering
+            and full_keeps_prior(entry, config)
+        )
+        if not keep:
+            drive_mode = None
     display_cfg = config.displays[0] if config and config.displays else None
     # Match upload_image(): only ask prepare_image() to build compressed data
     # when the panel accepts compressed uploads (plain ZIP bit or the

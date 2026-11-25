@@ -172,6 +172,19 @@ def uses_drive_write(mode: DisplayMode) -> bool:
     )
 
 
+def full_keeps_prior(entry: ConfigEntry, config: GlobalConfig | None) -> bool:
+    """Whether a stock full should go through the drive write, to keep its frame as the prior.
+
+    A plain upload's frame is not kept, so the hold-code mode after it would have to
+    draw a stock full instead. Only worth it when the user opted in to experimental
+    modes and the display declares a hold-code mode; the drive write leaves the same
+    picture as the plain full.
+    """
+    return experimental_enabled(entry) and any(
+        m.ext is not None and m.ext.hold_codes for m in display_modes(config)
+    )
+
+
 @dataclass(frozen=True)
 class DriveRequest:
     """An upload in a drive mode: the image and the options the drive path honours."""

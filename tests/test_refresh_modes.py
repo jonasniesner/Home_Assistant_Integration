@@ -245,13 +245,14 @@ async def test_a_display_without_drive_modes_has_no_sensor(
 # -- plain path for stock modes --------------------------------------------------
 
 
+@pytest.mark.parametrize("experimental", [False])
 async def test_the_stock_mode_uses_the_plain_upload_and_resets_the_budget(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_opendisplay_device: MagicMock,
     show: AsyncMock,
 ) -> None:
-    """Mode 0 goes through upload_prepared_image and is recorded as a stock drive."""
+    """Without the opt-in, mode 0 goes through upload_prepared_image as a stock drive."""
     await _setup(hass, mock_config_entry)
 
     await _upload(hass)
@@ -262,6 +263,45 @@ async def test_the_stock_mode_uses_the_plain_upload_and_resets_the_budget(
     assert sensor is not None
     assert sensor.state == "full"
     assert sensor.attributes["budget_used"] == 0
+
+
+async def test_a_stock_full_keeps_its_frame_for_the_next_hold_code_mode(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opendisplay_connect: MagicMock,
+    mock_opendisplay_device: MagicMock,
+    show: AsyncMock,
+) -> None:
+    """With the opt-in and a hold-code mode, a full is a drive write whose frame is the prior."""
+    display = mock_opendisplay_connect.return_value.display
+    display.last_frame = b"\x11" * 16
+    display.last_etag = 0x1234
+    display.last_changed = None
+    await _setup(hass, mock_config_entry)
+
+    await _upload(hass, mode="full")
+    await _upload(hass, mode="partialcool")
+
+    mock_opendisplay_device.upload_prepared_image.assert_not_awaited()
+    assert _shown_modes(show) == ["full", "partialcool"]
+    assert show.await_args_list[0].kwargs["prior"] is None
+    assert show.await_args_list[1].kwargs["prior"] == b"\x11" * 16
+    assert show.await_args_list[1].kwargs["prior_etag"] == 0x1234
+
+
+async def test_a_full_with_tone_compression_stays_plain(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opendisplay_device: MagicMock,
+    show: AsyncMock,
+) -> None:
+    """The drive write cannot honour tone compression, so such a full stays a plain upload."""
+    await _setup(hass, mock_config_entry)
+
+    await _upload(hass, mode="full", tone_compression=0.5)
+
+    mock_opendisplay_device.upload_prepared_image.assert_awaited_once()
+    show.assert_not_awaited()
 
 
 async def test_the_fast_mode_uses_the_fast_refresh(
