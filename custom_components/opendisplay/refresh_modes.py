@@ -47,6 +47,7 @@ from opendisplay.models.lut_lint import mode_problem
 from opendisplay.models.panel_drive import LUT_SLOT_NONE, DisplayMode
 from opendisplay.panels.drive_plan import DrivePlan, plan_drive, record_drive
 from opendisplay.panels.drive_state import DriveState, drive_fingerprint
+from opendisplay.exceptions import DriveEtagMismatchError
 from opendisplay.panels.prior import PriorConflictError
 
 from .const import (
@@ -288,14 +289,25 @@ class RefreshModeStore:
         except KeyError, TypeError, ValueError:
             return None
 
-    def put_prior(self, name: str, fingerprint: str, frame: bytes | None) -> None:
-        """Record the frame the panel shows now (None = unknown)."""
+    def get_prior_etag(self, name: str, fingerprint: str) -> int | None:
+        """The etag the device gave the prior frame (protocol 2.5), or None."""
+        raw = self._data["priors"].get(name)
+        if not isinstance(raw, dict) or raw.get("fingerprint") != fingerprint:
+            return None
+        etag = raw.get("etag")
+        return etag if isinstance(etag, int) and not isinstance(etag, bool) else None
+
+    def put_prior(
+        self, name: str, fingerprint: str, frame: bytes | None, etag: int | None = None
+    ) -> None:
+        """Record the frame the panel shows now (None = unknown) and its etag."""
         if frame is None:
             self.forget_prior(name)
             return
         self._data["priors"][name] = {
             "fingerprint": fingerprint,
             "frame": base64.b64encode(frame).decode(),
+            **({"etag": etag} if etag is not None else {}),
         }
         self._schedule_save()
 
@@ -525,14 +537,33 @@ def plan_upload(
     return plan, state, temp_c
 
 
+def _rebooted_since_last_connect(entry: OpenDisplayConfigEntry, device: Device) -> bool:
+    """Whether the latest advertisement still carries the reboot flag.
+
+    The firmware sets it at boot and clears it on the first connection, so a set flag means
+    nobody has connected since a reboot that may have redrawn the panel. Sleepy devices set
+    it on every wake (unpersisted), so it says nothing there.
+    """
+    if getattr(device.profile, "is_sleepy", False):
+        return False
+    coordinator = getattr(entry.runtime_data, "coordinator", None)
+    update = getattr(coordinator, "data", None)
+    advertisement = getattr(update, "advertisement", None)
+    return getattr(advertisement, "reboot_flag", None) is True
+
+
 async def _show(
     device: Device,
     request: DriveRequest,
     name: str,
     tables: dict[int, bytes] | None,
     prior: bytes | None,
+    prior_etag: int | None = None,
 ) -> int | None:
-    """One drive upload; library errors become RefreshModeError (PriorConflictError passes)."""
+    """One drive upload; library errors become RefreshModeError.
+
+    PriorConflictError and DriveEtagMismatchError pass: the caller draws stock instead.
+    """
     try:
         return await device.display.show(
             request.image,
@@ -544,6 +575,7 @@ async def _show(
             compress=request.compress,
             inline_luts=tables,
             prior=prior,
+            prior_etag=prior_etag,
         )
     except DriveModeSubstitutedError as err:
         raise RefreshModeError(
@@ -602,6 +634,12 @@ async def async_drive_upload(
     key = _device_key(entry)
     fingerprint = drive_fingerprint(config)
     prior = store.get_prior(key, fingerprint)
+    prior_etag = store.get_prior_etag(key, fingerprint)
+    if prior is not None and _rebooted_since_last_connect(entry, device):
+        _LOGGER.info("%s: the device rebooted since the last upload; prior frame dropped", entry.unique_id)
+        store.forget_prior(key)
+        prior = None
+        prior_etag = None
     ran: list[str] = []
     driven: int | None = None
     for step in plan.steps:
@@ -620,8 +658,15 @@ async def async_drive_upload(
         tables = inline.get(step_mode.mode_index)
         store.forget_prior(key)
         try:
-            temp_c = await _show(device, request, name, tables, use_prior)
-        except PriorConflictError as err:
+            temp_c = await _show(
+                device,
+                request,
+                name,
+                tables,
+                use_prior,
+                prior_etag if use_prior is not None else None,
+            )
+        except (PriorConflictError, DriveEtagMismatchError) as err:
             stock = stock_mode(config)
             if stock is None:
                 raise RefreshModeError(str(err)) from err
@@ -630,9 +675,11 @@ async def async_drive_upload(
             temp_c = await _show(device, request, name, None, None)
         frame = getattr(device.display, "last_frame", None)
         prior = bytes(frame) if isinstance(frame, (bytes, bytearray)) else None
+        etag = getattr(device.display, "last_etag", None)
+        prior_etag = etag if isinstance(etag, int) and not isinstance(etag, bool) else None
         changed = getattr(device.display, "last_changed", None)
         driven = changed if isinstance(changed, int) else None
-        store.put_prior(key, fingerprint, prior)
+        store.put_prior(key, fingerprint, prior, prior_etag)
         ran.append(name)
         state = record_drive(config, state, step_mode.mode_index, temp_c)
         store.put(key, state)

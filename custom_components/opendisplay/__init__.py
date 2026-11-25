@@ -419,6 +419,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
         if profile.is_sleepy:
             manager.request_config_resync()
         else:
+            # A reboot may redraw the panel (boot screen): the stored prior frame is stale.
+            if entry.runtime_data.refresh_modes is not None:
+                entry.runtime_data.refresh_modes.forget_prior(entry.unique_id or entry.entry_id)
             hass.async_create_task(_async_reload_after_reboot(hass, entry))
 
     entry.async_on_unload(coordinator.async_subscribe_reboot(_schedule_reboot_reload))
