@@ -19,7 +19,9 @@ from homeassistant.const import (
     UnitOfElectricPotential,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from opendisplay import voltage_to_percent
@@ -28,8 +30,10 @@ from opendisplay.models.config import SensorData
 from opendisplay.models.enums import CapacityEstimator, PowerMode, SensorType
 
 from . import OpenDisplayConfigEntry
+from .const import SIGNAL_DRIVE_RUN
 from .coordinator import OpenDisplayUpdate
 from .entity import OpenDisplayEntity
+from .refresh_modes import DriveRun, RefreshModeStore, display_modes
 
 PARALLEL_UPDATES = 0
 
@@ -181,6 +185,9 @@ async def async_setup_entry(
         )
         for description in descriptions
     )
+    store = entry.runtime_data.refresh_modes
+    if store is not None and len(display_modes(device_config)) > 1:
+        async_add_entities([OpenDisplayLastRefreshModeSensor(entry, store)])
 
 
 class OpenDisplaySensorEntity(OpenDisplayEntity, SensorEntity):
@@ -214,3 +221,47 @@ class OpenDisplayLastSeenSensor(OpenDisplaySensorEntity):
         # wall time with the same offset the advertisement monitor uses.
         wall = info.time + (time.time() - time.monotonic())
         return datetime.fromtimestamp(wall, tz=UTC)
+
+
+class OpenDisplayLastRefreshModeSensor(SensorEntity):
+    """The drive mode the last upload actually ran, with what was asked for."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "last_refresh_mode"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, entry: OpenDisplayConfigEntry, store: RefreshModeStore) -> None:
+        """Initialize the sensor."""
+        address = entry.unique_id
+        assert address is not None
+        self._address = address
+        self._store = store
+        self._attr_unique_id = f"{address}-last_refresh_mode"
+        self._attr_device_info = DeviceInfo(
+            connections={(CONNECTION_BLUETOOTH, address)}
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        """The mode of the last upload's final drive."""
+        run = self._store.last_run
+        return run.chosen if run is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object] | None:
+        """Every drive of the last upload, the temperature and the budget."""
+        run = self._store.last_run
+        return run.as_attributes() if run is not None else None
+
+    async def async_added_to_hass(self) -> None:
+        """Update after each upload."""
+
+        @callback
+        def _on_run(_run: DriveRun) -> None:
+            self.async_write_ha_state()
+
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, f"{SIGNAL_DRIVE_RUN}_{self._address}", _on_run
+            )
+        )

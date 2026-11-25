@@ -49,6 +49,7 @@ from opendisplay import (
 from .ble_lock import ble_connection
 from .const import (
     CONF_ENCRYPTION_KEY,
+    CONF_EXPERIMENTAL_MODES,
     CONF_GITHUB_TOKEN,
     CONF_HOST,
     CONF_MISSED_CYCLES,
@@ -58,6 +59,7 @@ from .const import (
     CONF_SLEEP_MODE,
     CONF_TLS,
     CONNECT_PROBE_DEADLINE_S,
+    DEFAULT_EXPERIMENTAL_MODES,
     DEFAULT_LAN_PORT,
     DEFAULT_MISSED_CYCLES,
     DEFAULT_PROBE_BEFORE_QUEUE,
@@ -144,6 +146,9 @@ def _options_schema() -> vol.Schema:
             ),
             vol.Required(
                 CONF_PROBE_BEFORE_QUEUE, default=DEFAULT_PROBE_BEFORE_QUEUE
+            ): BooleanSelector(),
+            vol.Required(
+                CONF_EXPERIMENTAL_MODES, default=DEFAULT_EXPERIMENTAL_MODES
             ): BooleanSelector(),
             vol.Optional(CONF_GITHUB_TOKEN): TextSelector(
                 TextSelectorConfig(type=TextSelectorType.PASSWORD)

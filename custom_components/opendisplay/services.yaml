@@ -51,6 +51,10 @@ upload_image:
                 - "full"
                 - "fast"
                 - "partial"
+        mode:
+          required: false
+          selector:
+            text:
         fit_mode:
           required: false
           default: "contain"
@@ -424,6 +428,12 @@ drawcustom:
             - "full"
             - "fast"
             - "partial"
+    mode:
+      name: Drive mode
+      description: Drive mode by name, overriding the display's refresh-mode select.
+      required: false
+      selector:
+        text:
     tone_compression:
       name: Tone compression
       description: Tone compression strength (0–100%). Omit for no compression.

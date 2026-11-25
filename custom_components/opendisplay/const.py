@@ -89,3 +89,14 @@ CONF_CACHED_STATE = "cached_state"
 # --- Bus events -------------------------------------------------------------
 EVENT_CONTENT_DELIVERED = f"{DOMAIN}_content_delivered"
 EVENT_CONTENT_EXPIRED = f"{DOMAIN}_content_expired"
+
+# --- Refresh (drive) modes ----------------------------------------------------
+# Option: offer the drive modes the device config flags EXPERIMENTAL (0xAE mode
+# tail bit 0) in the refresh-mode select, the service `mode` field and the
+# preset-update repair.
+CONF_EXPERIMENTAL_MODES = "experimental_refresh_modes"
+DEFAULT_EXPERIMENTAL_MODES = False
+
+# Carries the DriveRun of the latest upload (see refresh_modes.py); consumed by
+# the refresh-mode select and the "last refresh mode" sensor.
+SIGNAL_DRIVE_RUN = f"{DOMAIN}_drive_run"

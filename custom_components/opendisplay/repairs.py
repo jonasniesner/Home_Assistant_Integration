@@ -3,6 +3,10 @@
 A firmware 3.0 display updated from 2.x keeps its config, which has no drive data for its panel,
 so it draws nothing (READ_IDENT NEEDS_MIGRATION). py-opendisplay plans the change from its
 bundled panel database and keeps every other packet; the fix flow saves a backup and writes it.
+
+A display whose drive data came from an older revision of the bundled preset gets a second
+fixable issue: the fix rewrites only the drive packets (0xAE/0xAF/0xB0/0xB1), keeps a palette
+measured on that unit, and writes experimental modes only when the user opted in to them.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,7 +32,13 @@ import homeassistant.util.dt as dt_util
 from opendisplay import OpenDisplayError, connect
 from opendisplay.models.config import GlobalConfig
 from opendisplay.models.config_json import config_to_json
+from opendisplay.models.profile import DeviceProfile
 from opendisplay.panels import MigrationPlan, PanelDatabase, PanelEntry, apply_migration
+from opendisplay.panels.preset_update import (
+    PresetUpdatePlan,
+    apply_preset_update,
+    plan_preset_update,
+)
 from opendisplay.setup.configure import (
     ConfigMismatchError,
     strip_secrets,
@@ -37,13 +48,19 @@ from opendisplay.setup.configure import (
 from .ble_lock import ble_connection
 from .const import CONF_ENCRYPTION_KEY, DOMAIN, SETUP_DEADLINE_S
 from .keystore import EntryKeyStore
+from .refresh_modes import experimental_enabled
 
 if TYPE_CHECKING:
     from opendisplay.device.api import Device
 
     from . import OpenDisplayConfigEntry
 
+_LOGGER = logging.getLogger(__name__)
+
 BACKUP_DIR = ("opendisplay", "backups")
+# The packets a preset update may add or remove: the drive data, never security
+# (0x27), WiFi or anything else.
+DRIVE_PACKET_TYPES = frozenset({0xAE, 0xAF, 0xB0, 0xB1})
 
 
 class MigrationUnavailableError(HomeAssistantError):
@@ -285,6 +302,204 @@ class NeedsMigrationRepairFlow(RepairsFlow):
         )
 
 
+_PRESET_UPDATE_PREFIX = "preset_update_"
+_PANEL_DATABASE: PanelDatabase | None = None
+
+
+def preset_update_issue_id(entry: ConfigEntry) -> str:
+    """Return the repair issue id for a display whose drive preset has a newer revision."""
+    return f"{_PRESET_UPDATE_PREFIX}{entry.entry_id}"
+
+
+async def _async_database(hass: HomeAssistant) -> PanelDatabase:
+    global _PANEL_DATABASE  # the bundled database never changes at runtime
+    if _PANEL_DATABASE is None:
+        _PANEL_DATABASE = await hass.async_add_executor_job(PanelDatabase.load)
+    return _PANEL_DATABASE
+
+
+async def async_plan_preset_update(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    config: GlobalConfig,
+    profile: DeviceProfile,
+) -> PresetUpdatePlan:
+    """Plan the drive preset update for ``config`` (experimental modes per the entry's opt-in)."""
+    return plan_preset_update(
+        config,
+        profile,
+        await _async_database(hass),
+        include_experimental=experimental_enabled(entry),
+    )
+
+
+def _drive_update_ready(plan: PresetUpdatePlan) -> bool:
+    return plan.drive is not None and plan.drive.needed and not plan.drive.blocked
+
+
+async def async_update_preset_update_issue(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    config: GlobalConfig,
+    profile: DeviceProfile,
+) -> None:
+    """Raise the issue while the bundle has a newer drive preset for the display, remove it after."""
+    issue_id = preset_update_issue_id(entry)
+    if not config.display_modes:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+    try:
+        plan = await async_plan_preset_update(hass, entry, config, profile)
+    except (ValueError, KeyError, TypeError, AttributeError) as err:
+        _LOGGER.debug("%s: preset update check failed: %s", entry.unique_id, err)
+        return
+    if not _drive_update_ready(plan):
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+    update = next(u for u in plan.updates if u.applicable)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="preset_update",
+        translation_placeholders={
+            "name": entry.title,
+            "key": f"0x{update.key:04X}",
+            "device_rev": str(update.device_rev),
+            "bundle_rev": str(update.bundle_rev),
+        },
+        data={"entry_id": entry.entry_id},
+    )
+
+
+def _check_drive_only(
+    config: GlobalConfig, updated: GlobalConfig, plan: MigrationPlan
+) -> None:
+    """Refuse an update that would change anything but the drive packets."""
+    touched = {p.packet_type for p in (*plan.add, *plan.remove)}
+    if not touched <= DRIVE_PACKET_TYPES:
+        raise MigrationFailedError(
+            "the preset update would change packets other than the drive data"
+        )
+    if updated.security_config != config.security_config:
+        raise MigrationFailedError("the preset update would change the security packet")
+
+
+async def async_apply_preset_update(
+    hass: HomeAssistant, entry: OpenDisplayConfigEntry
+) -> Path:
+    """Back up the display's config, write the newer drive preset, and return the backup's path.
+
+    Raises:
+        MigrationUnavailableError: The display did not answer.
+        MigrationFailedError: No update is available any more, it is blocked, or the
+            write did not read back.
+
+    """
+    async with _async_connected(hass, entry) as device:
+        config = device.config.cached
+        if config is None:
+            raise MigrationFailedError("the display has no config")
+        plan = await async_plan_preset_update(hass, entry, config, device.profile)
+        if not _drive_update_ready(plan):
+            raise MigrationFailedError(
+                plan.drive.reason if plan.drive is not None else "no preset update"
+            )
+        try:
+            updated = apply_preset_update(config, plan)
+        except ValueError as err:
+            raise MigrationFailedError(str(err)) from err
+        assert plan.drive is not None
+        _check_drive_only(config, updated, plan.drive)
+        stem = f"{slugify(entry.title)}-{dt_util.now().strftime('%Y%m%d-%H%M%S')}"
+        try:
+            backup = await hass.async_add_executor_job(
+                _write_backup, Path(hass.config.path(*BACKUP_DIR)), stem, config
+            )
+        except OSError as err:
+            raise MigrationFailedError(f"the backup could not be saved: {err}") from err
+        try:
+            await write_and_verify(device, updated)
+        except (ConfigMismatchError, OpenDisplayError, TimeoutError) as err:
+            raise MigrationFailedError(str(err)) from err
+    return backup
+
+
+async def async_preview_preset_update(
+    hass: HomeAssistant, entry: OpenDisplayConfigEntry
+) -> PresetUpdatePlan:
+    """Return the preset update the display's current config would get."""
+    async with _async_connected(hass, entry) as device:
+        config = device.config.cached
+        if config is None:
+            return PresetUpdatePlan()
+        return await async_plan_preset_update(hass, entry, config, device.profile)
+
+
+class PresetUpdateRepairFlow(RepairsFlow):
+    """Write the newer revision of the display's drive preset, after a backup."""
+
+    def __init__(self, entry_id: str) -> None:
+        """Remember which entry's display to update."""
+        self._entry_id = entry_id
+        self._placeholders: dict[str, str] = {}
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> RepairsFlowResult:
+        """Read the display's config and show what would be written."""
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return self.async_create_entry(data={})
+        try:
+            plan = await async_preview_preset_update(self.hass, entry)
+        except MigrationUnavailableError:
+            return self.async_abort(
+                reason="cannot_connect", description_placeholders={"name": entry.title}
+            )
+        if not _drive_update_ready(plan):
+            ir.async_delete_issue(self.hass, DOMAIN, preset_update_issue_id(entry))
+            return self.async_create_entry(data={})
+        assert plan.drive is not None
+        update = next(u for u in plan.updates if u.applicable)
+        skipped = plan.drive.skipped_experimental
+        self._placeholders = {
+            "name": entry.title,
+            "panel": _panel_name(plan.drive),
+            "device_rev": str(update.device_rev),
+            "bundle_rev": str(update.bundle_rev),
+            "changelog": update.changelog or "-",
+            "kept": str(len(plan.drive.kept)),
+            "skipped": ", ".join(str(i) for i in skipped) if skipped else "none",
+        }
+        return await self.async_step_confirm()
+
+    async def async_step_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> RepairsFlowResult:
+        """Write the update once the user confirms."""
+        errors: dict[str, str] = {}
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if user_input is not None and entry is not None:
+            try:
+                await async_apply_preset_update(self.hass, entry)
+            except MigrationUnavailableError:
+                errors["base"] = "cannot_connect"
+            except MigrationFailedError:
+                errors["base"] = "write_failed"
+            else:
+                ir.async_delete_issue(self.hass, DOMAIN, preset_update_issue_id(entry))
+                self.hass.config_entries.async_schedule_reload(entry.entry_id)
+                return self.async_create_entry(data={})
+        return self.async_show_form(
+            step_id="confirm",
+            description_placeholders=self._placeholders,
+            errors=errors,
+        )
+
+
 async def async_create_fix_flow(
     hass: HomeAssistant, issue_id: str, data: dict[str, Any] | None
 ) -> RepairsFlow:
@@ -293,4 +508,6 @@ async def async_create_fix_flow(
     entry_id = str(data["entry_id"])
     if issue_id.startswith(_NEEDS_MIGRATION_PREFIX):
         return NeedsMigrationRepairFlow(entry_id)
+    if issue_id.startswith(_PRESET_UPDATE_PREFIX):
+        return PresetUpdateRepairFlow(entry_id)
     return KeyRotatedRepairFlow(entry_id)

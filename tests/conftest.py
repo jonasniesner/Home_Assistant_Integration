@@ -34,7 +34,6 @@ _DEVICE_NAMESPACES = (
     "custom_components.opendisplay.update.OpenDisplayDevice",
     "custom_components.opendisplay.services.OpenDisplayDevice",
     "custom_components.opendisplay.transport.OpenDisplayDevice",
-    "custom_components.opendisplay.delivery.OpenDisplayDevice",
 )
 # Modules that connect with opendisplay.connect(). Its device's ``legacy`` is the
 # OpenDisplayDevice mock below, so tests keep asserting on that one mock.

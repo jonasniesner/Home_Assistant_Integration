@@ -44,13 +44,18 @@ from .const import CONF_CACHED_STATE, CONF_ENCRYPTION_KEY, DOMAIN, SETUP_DEADLIN
 from .coordinator import OpenDisplayCoordinator
 from .delivery import DeliveryManager
 from .keystore import EntryKeyStore
-from .repairs import async_update_needs_migration_issue
+from .refresh_modes import RefreshModeStore
+from .repairs import (
+    async_update_needs_migration_issue,
+    async_update_preset_update_issue,
+)
 from .services import async_setup_services
 from .sleep import SleepProfile
 from .transport import last_mdns_sighting
 
 if TYPE_CHECKING:
     from opendisplay.models import FirmwareVersion
+    from opendisplay.models.profile import DeviceProfile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,12 +64,14 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 BASE_PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.IMAGE,
+    Platform.SELECT,
     Platform.SENSOR,
 ]
 FLEX_PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.EVENT,
     Platform.IMAGE,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.UPDATE,
 ]
@@ -105,6 +112,9 @@ class OpenDisplayRuntimeData:
     # Label of the transport the most recent delivery completed over
     # ("wifi"/"ble"); surfaced in diagnostics. None until a delivery runs.
     last_transport: str | None = None
+    # Selected refresh mode, per-device drive state (budget, band) and the last
+    # run, persisted in a Store (refresh_modes.py). Loaded before the platforms.
+    refresh_modes: RefreshModeStore | None = None
 
 
 type OpenDisplayConfigEntry = ConfigEntry[OpenDisplayRuntimeData]
@@ -229,6 +239,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
 
     ble_device = async_ble_device_from_address(hass, address, connectable=True)
     from_cache = False
+    device_profile: DeviceProfile | None = None
 
     if ble_device is None:
         cached = _cache_setup_if_sleepy(entry)
@@ -273,6 +284,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
                     landing_url = device.legacy.landing_url()
                     stored_config = device.config.cached
                     needs_migration = device.profile.needs_migration
+                    device_profile = device.profile
         except (
             AuthenticationFailedError,
             AuthenticationRequiredError,
@@ -373,6 +385,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
             hass, address, profile.availability_interval
         )
 
+    refresh_modes = RefreshModeStore(hass, entry.entry_id)
+    await refresh_modes.async_load()
+    entry.runtime_data.refresh_modes = refresh_modes
+
+    if device_profile is not None:
+        await async_update_preset_update_issue(
+            hass, entry, device_config, device_profile
+        )
+
     manager = DeliveryManager(hass, entry)
     entry.runtime_data.delivery = manager
 
@@ -450,7 +471,16 @@ async def async_unload_entry(
             await task
     async with runtime.ble_lock:
         pass
+    if runtime.refresh_modes is not None:
+        await runtime.refresh_modes.async_flush()
 
     return await hass.config_entries.async_unload_platforms(
         entry, _get_platforms(runtime)
     )
+
+
+async def async_remove_entry(
+    hass: HomeAssistant, entry: OpenDisplayConfigEntry
+) -> None:
+    """Delete the entry's stored refresh-mode state."""
+    await RefreshModeStore(hass, entry.entry_id).async_remove()

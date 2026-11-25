@@ -1232,6 +1232,8 @@ async def test_upload_image_preview_is_the_dithered_frame(
         },
         blocking=True,
     )
+    # A plain (non-callback) dispatcher target runs in the executor.
+    await hass.async_block_till_done()
 
     assert len(previews) == 1
     assert _is_dithered(previews[0])
@@ -1259,6 +1261,8 @@ async def test_drawcustom_dry_run_previews_the_dithered_frame(
             blocking=True,
             return_response=True,
         )
+    # A plain (non-callback) dispatcher target runs in the executor.
+    await hass.async_block_till_done()
 
     assert len(previews) == 1
     assert _is_dithered(previews[0])

@@ -64,14 +64,16 @@
           "missed_cycles": "Missed wake cycles before unavailable",
           "queue_timeout_hours": "Queued content timeout (hours)",
           "probe_before_queue": "Try connecting before queueing",
-          "github_token": "GitHub token (optional)"
+          "github_token": "GitHub token (optional)",
+          "experimental_refresh_modes": "Enable experimental refresh modes"
         },
         "data_description": {
           "sleep_mode": "Automatic follows the device's own power configuration (battery power with deep sleep enabled). Force on or off to override.",
           "missed_cycles": "How many expected wake-ups the device may miss before its entities are marked unavailable.",
           "queue_timeout_hours": "How long content queued for a sleeping device waits for a wake before it expires.",
           "probe_before_queue": "Before queueing an image for a sleeping device, make one quick connection attempt in case it is actually awake (missed advertisements, always-on radios). Adds at most a few seconds when the device really is asleep.",
-          "github_token": "Used only for the firmware update checks against the GitHub API, and applies to every OpenDisplay device. Without a token, all devices and other tools on the same network share GitHub's limit of 60 requests per hour. A fine-grained token with no extra permissions (public repositories, read-only) raises it to 5,000. Leave empty to stay anonymous."
+          "github_token": "Used only for the firmware update checks against the GitHub API, and applies to every OpenDisplay device. Without a token, all devices and other tools on the same network share GitHub's limit of 60 requests per hour. A fine-grained token with no extra permissions (public repositories, read-only) raises it to 5,000. Leave empty to stay anonymous.",
+          "experimental_refresh_modes": "EXPERIMENTAL, for desk testing. Offers the drive modes this display's configuration marks as experimental (faster or custom waveforms) in the Refresh mode select, the service mode field and the drive preset update. They are not validated on every panel and can leave ghosting or wrong colours; Home Assistant inserts a stock full refresh when the panel's budget runs out."
         }
       }
     }
@@ -127,11 +129,19 @@
       },
       "last_seen": {
         "name": "Last seen"
+      },
+      "last_refresh_mode": {
+        "name": "Last refresh mode"
       }
     },
     "update": {
       "firmware": {
         "name": "Firmware"
+      }
+    },
+    "select": {
+      "refresh_mode": {
+        "name": "Refresh mode"
       }
     }
   },
@@ -210,6 +220,15 @@
     },
     "device_not_configured": {
       "message": "The OpenDisplay device has no stored configuration. Configure it with the OpenDisplay website or CLI, then reload the integration."
+    },
+    "refresh_mode_unknown": {
+      "message": "The display has no refresh mode \"{mode}\". Its modes: {modes}."
+    },
+    "refresh_mode_experimental": {
+      "message": "Refresh mode \"{mode}\" is experimental. Enable experimental refresh modes in the device options to use it."
+    },
+    "refresh_mode_refused": {
+      "message": "Refresh mode \"{mode}\" cannot run: {error}"
     }
   },
   "selector": {
@@ -281,6 +300,10 @@
         "refresh_mode": {
           "description": "The display refresh mode. Full refresh clears ghosting but is slower. Fast refresh is not supported on all displays. Partial updates only the changed region without flashing (B/W panels with partial support; falls back to a full refresh automatically when not possible).",
           "name": "Refresh mode"
+        },
+        "mode": {
+          "name": "Drive mode",
+          "description": "A drive mode the display's configuration declares, by name (for example fast6 or colour16). Overrides the display's Refresh mode select for this call. Experimental modes need the option \"Enable experimental refresh modes\". Mode 0 (full) and fast keep the refresh mode above; any other mode ignores it, and also ignores tone compression and refined dithering."
         },
         "rotation": {
           "description": "The rotation angle in degrees, applied clockwise.",
@@ -481,6 +504,10 @@
           "description": "Display refresh mode. Partial updates only the changed region without flashing; falls back to a full refresh automatically when not possible.",
           "name": "Refresh type"
         },
+        "mode": {
+          "name": "Drive mode",
+          "description": "A drive mode the display's configuration declares, by name (for example fast6 or colour16). Overrides the display's Refresh mode select for this call. Experimental modes need the option \"Enable experimental refresh modes\". Mode 0 (full) and fast keep the refresh mode above; any other mode ignores it, and also ignores tone compression and refined dithering."
+        },
         "measured_palette": {
           "description": "Use the panel's measured color palette when available. Turn off to dither against the theoretical color scheme. No effect on panels without measured data.",
           "name": "Use measured palette"
@@ -525,6 +552,24 @@
         "abort": {
           "cannot_connect": "Could not reach {name}. Wake it, then open this repair again.",
           "migration_blocked": "Home Assistant cannot add the drive data: {reason}"
+        }
+      }
+    },
+    "preset_update": {
+      "title": "Newer drive data for {name}",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Update the drive data of {name}",
+            "description": "The bundled drive preset for {panel} is at revision {bundle_rev}; {name} carries revision {device_rev}.\n\nChanges: {changelog}\n\nHome Assistant rewrites only the drive data (modes, waveform tables, palettes, panel settings) and keeps everything else, including the key. Palettes measured on this unit are kept ({kept}). Experimental modes left out because they are not enabled: {skipped}. It first saves a backup of the current configuration, without its key, WiFi password and FindMy keys, in `opendisplay/backups` in your configuration folder.\n\nKeep {name} awake and in range."
+          }
+        },
+        "error": {
+          "cannot_connect": "Could not reach the display. Wake it and try again.",
+          "write_failed": "The configuration could not be written, or it did not read back as written. The backup is in `opendisplay/backups` in your configuration folder."
+        },
+        "abort": {
+          "cannot_connect": "Could not reach {name}. Wake it, then open this repair again."
         }
       }
     }

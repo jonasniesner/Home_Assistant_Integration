@@ -34,6 +34,7 @@
           'name': 'full',
           'passes': 1,
           'sequence': '011200',
+          'tail': '',
           'temp_max_c': 50,
           'temp_min_c': 0,
           'temp_policy': 0,

@@ -50,6 +50,7 @@ from opendisplay import (
     DitherMode,
     FitMode,
     GlobalConfig,
+    ImageEncodingError,
     LedFlashConfig,
     LedFlashStep,
     NfcNotSupportedError,
@@ -64,13 +65,29 @@ from opendisplay import (
     prepare_image,
     preview_image,
 )
+from opendisplay.device.imaging import prepare_multipass
+from opendisplay.models.panel_drive import DisplayMode
 
 if TYPE_CHECKING:
+    from opendisplay.device.api import Device
+
     from . import OpenDisplayConfigEntry
 
 from .ble_lock import ble_connection
 from .const import CONF_ENCRYPTION_KEY, DOMAIN, SIGNAL_IMAGE_UPDATED
 from .delivery import DELIVERY_DEADLINE_S, DeliveryReceipt
+from .refresh_modes import (
+    REFRESH_MODE_BY_NAME,
+    DriveRequest,
+    RefreshModeError,
+    async_drive_upload,
+    experimental_enabled,
+    frame_codes,
+    record_plain_upload,
+    resolve_mode,
+    stock_mode,
+    uses_drive_write,
+)
 from .repairs import async_display_needs_migration
 from .transport import async_run_with_fallback
 
@@ -78,6 +95,8 @@ ATTR_IMAGE = "image"
 ATTR_ROTATION = "rotation"
 ATTR_DITHER_MODE = "dither_mode"
 ATTR_REFRESH_MODE = "refresh_mode"
+# A drive mode by its 0xAE name, overriding the display's refresh-mode select.
+ATTR_MODE = "mode"
 ATTR_FIT_MODE = "fit_mode"
 ATTR_TONE_COMPRESSION = "tone_compression"
 ATTR_REFINE_DITHERING = "refine_dithering"
@@ -162,6 +181,7 @@ SCHEMA_UPLOAD_IMAGE = vol.Schema(
         ),
         vol.Optional(ATTR_DITHER_MODE, default="burkes"): _str_to_enum(DitherMode),
         vol.Optional(ATTR_REFRESH_MODE, default="full"): _refresh_type_value,
+        vol.Optional(ATTR_MODE): cv.string,
         vol.Optional(ATTR_FIT_MODE, default="contain"): _str_to_enum(FitMode),
         vol.Optional(ATTR_TONE_COMPRESSION): vol.All(
             vol.Coerce(float), vol.Range(min=0.0, max=100.0)
@@ -184,6 +204,7 @@ SCHEMA_DRAWCUSTOM = vol.Schema(
         ),
         vol.Optional("dither", default="burkes"): _str_to_enum(DitherMode),
         vol.Optional("refresh_type", default="full"): _refresh_type_value,
+        vol.Optional(ATTR_MODE): cv.string,
         vol.Optional(ATTR_TONE_COMPRESSION): vol.All(
             vol.Coerce(float), vol.Range(min=0.0, max=100.0)
         ),
@@ -438,10 +459,12 @@ PROBE_CONNECT_DEADLINE_S = 8.0
 async def _async_connect_and_run(
     hass: HomeAssistant,
     entry: OpenDisplayConfigEntry,
-    action: Callable[[OpenDisplayDevice], Awaitable[None]],
+    action: Callable[[OpenDisplayDevice], Awaitable[None]]
+    | Callable[[Device], Awaitable[None]],
     reraise_ble: bool = False,
     *,
     connect_deadline: float | None = None,
+    api: bool = False,
 ) -> None:
     """Resolve BLE device, open a connection, run action, handle auth errors.
 
@@ -450,7 +473,8 @@ async def _async_connect_and_run(
     translated ``device_not_found``/``upload_error``, so the caller can defer
     the work to the delivery queue. ``connect_deadline`` bounds the connect —
     used by the probe path to give up quickly on a likely-doomed attempt;
-    ``None`` keeps the library's own budget (10 s x 4 attempts).
+    ``None`` keeps the library's own budget (10 s x 4 attempts). ``api`` hands
+    ``action`` the ``Device`` instead of its ``OpenDisplayDevice``.
     """
     address = entry.unique_id
     assert address is not None
@@ -524,6 +548,7 @@ async def _async_connect_and_run(
                 encryption_key=encryption_key,
                 ble_unavailable=_ble_unavailable,
                 connect_deadline=connect_deadline,
+                api=api,
             )
     except TimeoutError as err:
         raise HomeAssistantError(
@@ -574,8 +599,26 @@ def _prepare_frame(
     rotate: Rotation,
     use_measured_palettes: bool,
     refine_dithering: bool,
+    drive_mode: DisplayMode | None = None,
 ) -> tuple[tuple[bytes, bytes | None, PILImage.Image], bytes]:
-    """Dither and encode a frame, plus a JPEG preview of it as the panel shows it."""
+    """Dither and encode a frame, plus a JPEG preview of it as the panel shows it.
+
+    With ``drive_mode`` the frame is encoded as that mode encodes it (its pass
+    count and palette), uncompressed; the upload re-encodes it on the device's
+    own path, so the result only feeds the preview and the frame's panel codes.
+    """
+    if drive_mode is not None and config is not None:
+        frames, dithered = prepare_multipass(
+            img,
+            config,
+            drive_mode,
+            use_measured_palettes=use_measured_palettes,
+            dither_mode=dither_mode,
+            fit=fit,
+            rotate=rotate,
+        )
+        preview = preview_image(dithered, config=config, rotate=rotate)
+        return (frames, None, dithered), _pil_to_jpeg(preview)
     prepared = prepare_image(
         img,
         config=config,
@@ -605,6 +648,7 @@ async def _async_send_image(
     use_measured_palettes: bool = True,
     refine_dithering: bool = False,
     dry_run: bool = False,
+    mode: str | None = None,
 ) -> DeliveryReceipt:
     """Upload a PIL image, delivering live or queuing it for the next wake.
 
@@ -612,6 +656,11 @@ async def _async_send_image(
     queued (for a sleeping device). Non-sleepy devices always deliver live and
     keep the original strict-failure behavior. A dry run only updates the
     preview with the dithered frame.
+
+    ``mode`` names a drive mode (else the display's refresh-mode select is
+    used). Mode 0 and "fast" go through the plain upload; any other mode goes
+    through the host-side drive plan (refresh_modes.py), and ``refresh_mode``,
+    tone and refined dithering do not apply to it.
     """
     # Split the upload into its heavy CPU half and its BLE-I/O half. The CPU
     # work (rotate + fit + dither + encode + zlib on a full frame) is offloaded
@@ -619,6 +668,10 @@ async def _async_send_image(
     # transfer runs on the loop. This mirrors what device.upload_image() does
     # internally, but that call ran _prepare_image synchronously on the loop.
     config = entry.runtime_data.device_config
+    drive_mode = _effective_drive_mode(entry, config, mode)
+    if drive_mode is not None and not uses_drive_write(drive_mode):
+        refresh_mode = REFRESH_MODE_BY_NAME.get(drive_mode.name.lower(), refresh_mode)
+        drive_mode = None
     display_cfg = config.displays[0] if config and config.displays else None
     # Match upload_image(): only ask prepare_image() to build compressed data
     # when the panel accepts compressed uploads (plain ZIP bit or the
@@ -629,20 +682,40 @@ async def _async_send_image(
         if display_cfg
         else True
     )
-    prepared, jpeg = await hass.async_add_executor_job(
-        functools.partial(
-            _prepare_frame,
-            img,
-            config,
-            compress=supports_compression,
+    try:
+        prepared, jpeg = await hass.async_add_executor_job(
+            functools.partial(
+                _prepare_frame,
+                img,
+                config,
+                compress=supports_compression,
+                dither_mode=dither_mode,
+                fit=fit,
+                tone=tone,
+                rotate=rotate,
+                use_measured_palettes=use_measured_palettes,
+                refine_dithering=refine_dithering,
+                drive_mode=drive_mode,
+            )
+        )
+    except ImageEncodingError as err:
+        if drive_mode is None:
+            raise
+        raise RefreshModeError(
+            f"The image cannot be encoded for drive mode '{drive_mode.name}': {err}"
+        ) from err
+    drive: DriveRequest | None = None
+    if drive_mode is not None:
+        drive = DriveRequest(
+            mode=drive_mode.name,
+            image=img,
             dither_mode=dither_mode,
             fit=fit,
-            tone=tone,
             rotate=rotate,
             use_measured_palettes=use_measured_palettes,
-            refine_dithering=refine_dithering,
+            compress=supports_compression,
+            codes=frame_codes(prepared[0], config, drive_mode),
         )
-    )
     if dry_run:
         async_dispatcher_send(hass, f"{SIGNAL_IMAGE_UPDATED}_{entry.unique_id}", jpeg)
         return DeliveryReceipt(status="dry_run", expires_at=None)
@@ -660,7 +733,7 @@ async def _async_send_image(
     # the region to the full frame on panels that require it
     # (partial_update_support=2, see OpenDisplay/Firmware#80).
     runtime = entry.runtime_data
-    if refresh_mode is not RefreshMode.PARTIAL:
+    if refresh_mode is not RefreshMode.PARTIAL or drive is not None:
         runtime.partial_state = PartialState()
     state = runtime.partial_state
 
@@ -679,12 +752,17 @@ async def _async_send_image(
             partial_state=state,
             preview_jpeg=jpeg,
             device_id=device_id,
+            drive=drive,
         )
 
-    async def _upload(device: OpenDisplayDevice) -> None:
-        await device.upload_prepared_image(
+    async def _upload(device: Device) -> None:
+        if drive is not None:
+            await async_drive_upload(hass, entry, device, drive)
+            return
+        await device.legacy.upload_prepared_image(
             prepared, refresh_mode=refresh_mode, state=state
         )
+        record_plain_upload(hass, entry, config, refresh_mode)
 
     # Freshness gate: a probably-asleep tag will not usually answer a live
     # connect. Instead of queuing blind, spend one short connect attempt (the
@@ -714,6 +792,7 @@ async def _async_send_image(
             _upload,
             reraise_ble=sleepy,
             connect_deadline=connect_deadline,
+            api=True,
         )
     except _DeviceUnavailable:
         # The device was dark, dropped, or refused the link; defer.
@@ -733,6 +812,26 @@ async def _async_send_image(
 
     async_dispatcher_send(hass, f"{SIGNAL_IMAGE_UPDATED}_{entry.unique_id}", jpeg)
     return DeliveryReceipt(status="delivered", expires_at=None)
+
+
+def _effective_drive_mode(
+    entry: OpenDisplayConfigEntry, config: GlobalConfig | None, requested: str | None
+) -> DisplayMode | None:
+    """Return the drive mode an upload runs in: the call's ``mode``, else the selected one.
+
+    None when the display declares no drive modes and no mode was asked for.
+    """
+    store = entry.runtime_data.refresh_modes
+    name = requested or (store.selected if store is not None else None)
+    if name is None:
+        return stock_mode(config)
+    try:
+        return resolve_mode(config, name, experimental_enabled(entry))
+    except ServiceValidationError:
+        if requested is not None:
+            raise
+        # A stale selection (the drive data or the opt-in changed): stock mode.
+        return stock_mode(config)
 
 
 def _receipt_response(receipt: DeliveryReceipt) -> ServiceResponse:
@@ -807,6 +906,7 @@ async def _async_upload_image(call: ServiceCall) -> ServiceResponse:
             rotate=rotation,
             use_measured_palettes=use_measured_palettes,
             refine_dithering=call.data[ATTR_REFINE_DITHERING],
+            mode=call.data.get(ATTR_MODE),
         )
         return _receipt_response(receipt)
     except asyncio.CancelledError:
@@ -1038,6 +1138,7 @@ async def _drawcustom_for_device(
         use_measured_palettes=use_measured_palettes,
         refine_dithering=call.data[ATTR_REFINE_DITHERING],
         dry_run=call.data["dry-run"],
+        mode=call.data.get(ATTR_MODE),
     )
 
 

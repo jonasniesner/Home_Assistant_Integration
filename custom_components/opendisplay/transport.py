@@ -46,6 +46,8 @@ from .const import (
 from .keystore import EntryKeyStore
 
 if TYPE_CHECKING:
+    from opendisplay.device.api import Device
+
     from . import OpenDisplayConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
@@ -156,13 +158,17 @@ def record_last_transport(entry: OpenDisplayConfigEntry, transport: str) -> None
 
 
 async def _connect_and_run(
-    action: Callable[[OpenDisplayDevice], Awaitable[None]],
+    action: Callable[[Any], Awaitable[None]],
     encryption_key: bytes | None,
     key_store: EntryKeyStore,
     connect_deadline: float | None,
+    api: bool,
     **addressing: Any,
 ) -> None:
     """Connect with ``opendisplay.connect()`` and run ``action`` on the device.
+
+    ``action`` gets the ``OpenDisplayDevice`` (``device.legacy``), or with ``api``
+    the ``Device`` itself (drive modes, ``display.show``).
 
     ``connect_deadline`` bounds only entering the connection (link, firmware
     version, identity, security, config), not ``action``. A breach is raised as
@@ -185,17 +191,19 @@ async def _connect_and_run(
             raise BLETimeoutError(
                 f"Connecting took longer than {connect_deadline:.0f}s"
             ) from err
-        await action(device.legacy)
+        await action(device if api else device.legacy)
 
 
 async def async_run_with_fallback(
     hass: HomeAssistant,
     entry: OpenDisplayConfigEntry,
-    action: Callable[[OpenDisplayDevice], Awaitable[None]],
+    action: Callable[[OpenDisplayDevice], Awaitable[None]]
+    | Callable[[Device], Awaitable[None]],
     *,
     encryption_key: bytes | None,
     ble_unavailable: Callable[[], BaseException],
     connect_deadline: float | None = None,
+    api: bool = False,
 ) -> str:
     """Open a device and run ``action`` over the resolved transport.
 
@@ -223,6 +231,7 @@ async def async_run_with_fallback(
                 encryption_key,
                 key_store,
                 connect_deadline,
+                api,
                 host=resolved.host,
                 port=resolved.port,
                 tls=resolved.tls,
@@ -248,6 +257,7 @@ async def async_run_with_fallback(
         encryption_key,
         key_store,
         connect_deadline,
+        api,
         address=address,
         ble_device=ble_device,
     )

@@ -26,7 +26,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -37,7 +37,6 @@ from opendisplay import (
     AuthenticationRequiredError,
     BLEConnectionError,
     BLETimeoutError,
-    OpenDisplayDevice,
     OpenDisplayError,
     PartialState,
     RefreshMode,
@@ -52,9 +51,17 @@ from .const import (
     SIGNAL_IMAGE_UPDATED,
     SIGNAL_PENDING_STATE,
 )
+from .refresh_modes import (
+    DriveRequest,
+    RefreshModeError,
+    async_drive_upload,
+    record_plain_upload,
+)
 from .transport import async_run_with_fallback
 
 if TYPE_CHECKING:
+    from opendisplay.device.api import Device
+
     from . import OpenDisplayConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
@@ -92,6 +99,9 @@ class PendingUpload:
     expires_at: float
     attempts: int = 0
     cancel_deadline: CALLBACK_TYPE | None = None
+    # Set for an upload in a drive mode: planned and driven at delivery time,
+    # with the drive state and temperature known then.
+    drive: DriveRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +207,7 @@ class DeliveryManager:
         partial_state: PartialState,
         preview_jpeg: bytes,
         device_id: str | None,
+        drive: DriveRequest | None = None,
     ) -> DeliveryReceipt:
         """Queue a prepared image for delivery at the next wake (latest-wins)."""
         now = time.time()
@@ -212,6 +223,7 @@ class DeliveryManager:
             device_id=device_id,
             queued_at=now,
             expires_at=expires_at,
+            drive=drive,
         )
         self._schedule_expiry(slot)
         self._pending_upload = slot
@@ -314,6 +326,13 @@ class DeliveryManager:
         except OpenDisplayError as err:
             _LOGGER.warning("%s: delivery failed: %s", self._address, err)
             self._register_attempt_failure(str(err))
+        except (RefreshModeError, ServiceValidationError) as err:
+            # The drive mode cannot run on this display; another wake will not help.
+            _LOGGER.error(
+                "%s: queued drive-mode upload refused: %s", self._address, err
+            )
+            if self._pending_upload is not None:
+                self._give_up_upload(self._pending_upload, str(err))
         finally:
             self._delivering = False
             self._delivery_task = None
@@ -329,7 +348,7 @@ class DeliveryManager:
             self._pause_for_auth(start_reauth=False)
             return
 
-        async def _run(device: OpenDisplayDevice) -> None:
+        async def _run(device: Device) -> None:
             # Re-read pending state each invocation: if a WiFi attempt uploaded
             # then failed on resync, the BLE fallback re-runs this and must not
             # re-upload an already-delivered frame (``_drain_upload`` clears it).
@@ -354,17 +373,25 @@ class DeliveryManager:
                 _run,
                 encryption_key=key,
                 ble_unavailable=lambda: BLEConnectionError("device not connectable"),
+                api=True,
             )
 
-    async def _drain_upload(
-        self, device: OpenDisplayDevice, upload: PendingUpload
-    ) -> None:
+    async def _drain_upload(self, device: Device, upload: PendingUpload) -> None:
         """Send the queued prepared image and fire the delivered event."""
-        await device.upload_prepared_image(
-            upload.prepared,
-            refresh_mode=upload.refresh_mode,
-            state=upload.partial_state,
-        )
+        if upload.drive is not None:
+            await async_drive_upload(self._hass, self._entry, device, upload.drive)
+        else:
+            await device.legacy.upload_prepared_image(
+                upload.prepared,
+                refresh_mode=upload.refresh_mode,
+                state=upload.partial_state,
+            )
+            record_plain_upload(
+                self._hass,
+                self._entry,
+                self._entry.runtime_data.device_config,
+                upload.refresh_mode,
+            )
         if upload.cancel_deadline:
             upload.cancel_deadline()
         self._pending_upload = None
@@ -377,11 +404,12 @@ class DeliveryManager:
         self._notify_state()
         _LOGGER.info("%s: queued content delivered", self._address)
 
-    async def _drain_resync(self, device: OpenDisplayDevice) -> None:
+    async def _drain_resync(self, api_device: Device) -> None:
         """Re-read firmware/config over the open link and refresh the cache."""
         # Local import avoids an import cycle (__init__ imports this module).
         from . import _write_cache
 
+        device = api_device.legacy
         fw = await device.read_firmware_version()
         is_flex = device.is_flex
         landing_url = device.landing_url()
