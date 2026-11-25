@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 import logging
@@ -39,7 +39,7 @@ from opendisplay.ota import perform_silabs_ota
 
 from . import OpenDisplayConfigEntry, _get_encryption_key
 from .ble_lock import ble_connection
-from .const import CONF_GITHUB_TOKEN, DOMAIN
+from .const import CONF_GITHUB_TOKEN, DATA_FIRMWARE_UPGRADES, DOMAIN
 from .entity import OpenDisplayEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -186,6 +186,164 @@ async def async_setup_entry(
     )
 
 
+def device_probably_asleep(entry: OpenDisplayConfigEntry) -> bool:
+    """Return whether a deep-sleeping tag is most likely dark right now.
+
+    The multi-connection AppLoader flash (DFU trigger -> reconnect -> OTA) cannot
+    be driven reliably inside a ~10 s wake window, so a flash must not start then.
+    """
+    runtime = entry.runtime_data
+    profile = runtime.sleep_profile
+    if not profile.is_sleepy:
+        return False
+    last_seen = runtime.coordinator.data.last_seen if runtime.coordinator.data else None
+    return profile.probably_asleep(last_seen)
+
+
+class OTAFlashError(HomeAssistantError):
+    """The BLE flash failed.
+
+    ``reached_apploader`` is set when the failure came after the device was
+    asked to reboot into the AppLoader (or was found there): it may now sit in
+    the AppLoader, with its config intact, until it is flashed again.
+    """
+
+    def __init__(self, message: str, *, reached_apploader: bool) -> None:
+        """Remember how far the flash got."""
+        super().__init__(message)
+        self.reached_apploader = reached_apploader
+
+
+async def async_flash_silabs(
+    hass: HomeAssistant,
+    entry: OpenDisplayConfigEntry,
+    firmware_bytes: bytes,
+    *,
+    on_progress: Callable[[float], None],
+) -> None:
+    """Flash a GBL image to an EFR32BG22 over BLE (DFU trigger + AppLoader OTA).
+
+    Shared by the update entity and the guided 2.x -> 3.x upgrade.
+
+    Raises:
+        OTAFlashError: The flash failed (connection or AppLoader transfer).
+        HomeAssistantError: The device is not in range, the deadline passed, or
+            the key was rejected (reauth started).
+
+    """
+    address: str = entry.unique_id or ""
+
+    def _on_log(msg: str) -> None:
+        _LOGGER.debug("OTA: %s", msg)
+
+    ble_device = async_ble_device_from_address(hass, address, connectable=True)
+    if ble_device is None:
+        raise HomeAssistantError(
+            "Device not reachable over Bluetooth; bring it within range and retry"
+        )
+
+    # Bound to the OTA deadline block so its .expired() distinguishes a
+    # deadline breach from an unrelated TimeoutError.
+    ota_deadline: asyncio.Timeout | None = None
+    reached_apploader = False
+    try:
+        # Hold the per-MAC BLE lock across the whole OTA (DFU trigger +
+        # AppLoader flash) so a drawcustom/upload/LED/buzzer service call on
+        # this tag can't open an overlapping connection mid-flash. This op
+        # only takes the lock here — it never calls back into a locked
+        # service op — so there is no re-entrant deadlock. The download
+        # runs outside the lock so it doesn't block other BLE ops needlessly.
+        # Bound the BLE work with a wall-clock deadline so a device that keeps
+        # half-connecting can't hold the lock forever (OTA_INSTALL_DEADLINE_S).
+        async with (
+            asyncio.timeout(OTA_INSTALL_DEADLINE_S) as ota_deadline,
+            ble_connection(address, "firmware update (OTA)"),
+        ):
+            # Only EFR32BG22 (Silabs AppLoader) is flashed over BLE here — see
+            # _OTA_INSTALL_IC_TYPES. The device is either in app mode (and needs
+            # the DFU trigger) or already in the AppLoader at the same address (a
+            # previous OTA was interrupted, or it browned out before committing).
+            # Try to trigger from app mode, but tolerate the connect failing —
+            # then the device is already in the AppLoader and we flash it
+            # directly, so HA can recover a stuck device instead of failing hard.
+            # A stale proxy GATT cache from a prior interrupted OTA is handled at
+            # the connection layer: BLEConnection.connect() clears it and retries.
+            try:
+                _on_log("Connecting to trigger DFU bootloader…")
+                async with OpenDisplayDevice(
+                    mac_address=address,
+                    ble_device=ble_device,
+                    encryption_key=_get_encryption_key(entry),
+                ) as device:
+                    # Clear the (now fresh) app-mode GATT from the proxy cache so
+                    # the post-reboot AppLoader connection re-discovers the OTA
+                    # service instead of these app-firmware handles.
+                    cleared = await device.clear_gatt_cache()
+                    _on_log(f"Proxy GATT cache clear requested: {cleared}")
+                    await device.trigger_dfu_bootloader()
+            except BLEConnectionError as err:
+                _on_log(
+                    f"App-mode connect failed ({err}); device is likely already "
+                    "in the AppLoader — attempting OTA directly."
+                )
+            reached_apploader = True
+
+            # AppLoader advertises at the same address; perform_silabs_ota
+            # retries the connection internally until it is ready.
+            ota_device = async_ble_device_from_address(hass, address, connectable=True)
+            if ota_device is None:
+                raise OTAFlashError(
+                    "Device not reachable in OTA mode; bring it within range and retry",
+                    reached_apploader=True,
+                )
+            await perform_silabs_ota(
+                firmware_bytes,
+                ota_device,
+                on_progress=on_progress,
+                on_log=_on_log,
+            )
+
+    except TimeoutError as err:
+        # Only relabel when our OTA deadline actually fired; re-raise any other
+        # TimeoutError with its true cause.
+        if ota_deadline is not None and ota_deadline.expired():
+            raise OTAFlashError(
+                f"Firmware update timed out after {OTA_INSTALL_DEADLINE_S:.0f}s",
+                reached_apploader=reached_apploader,
+            ) from err
+        raise
+    except (AuthenticationFailedError, AuthenticationRequiredError) as err:
+        # The app-mode connect for the DFU trigger authenticates with the
+        # stored key. An auth failure here is a subclass of OpenDisplayError,
+        # not OTAError/BLEConnectionError, so without this it would leak as a
+        # raw exception with no reauth. Start reauth and surface the standard
+        # auth message.
+        _LOGGER.warning(
+            "%s: device rejected the encryption key during OTA (%s); "
+            "reauthentication required",
+            address,
+            err,
+        )
+        entry.async_start_reauth(hass)
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="authentication_error",
+        ) from err
+    except ConfigEntryAuthFailed as err:
+        # Malformed stored key — already logged at ERROR in _get_encryption_key.
+        # Convert to reauth + the standard auth message (a raw ConfigEntryAuthFailed
+        # from an entity method does not auto-trigger reauth).
+        entry.async_start_reauth(hass)
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="authentication_error",
+        ) from err
+    except (OTAError, BLEConnectionError) as err:
+        raise OTAFlashError(
+            f"Firmware update failed: {err}", reached_apploader=reached_apploader
+        ) from err
+
+
 class OpenDisplayFirmwareUpdateEntity(
     OpenDisplayEntity[UpdateEntityDescription], UpdateEntity
 ):
@@ -292,17 +450,20 @@ class OpenDisplayFirmwareUpdateEntity(
         # AppLoader flash (DFU trigger -> reconnect -> OTA) cannot be driven
         # reliably inside a ~10 s wake window. Rather than start an install that
         # will strand mid-flash, fail fast with clear guidance to wake it first.
-        runtime = self._entry.runtime_data
-        profile = runtime.sleep_profile
-        if profile.is_sleepy:
-            last_seen = (
-                runtime.coordinator.data.last_seen if runtime.coordinator.data else None
+        if device_probably_asleep(self._entry):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="device_sleeping_ota",
             )
-            if profile.probably_asleep(last_seen):
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="device_sleeping_ota",
-                )
+        # The guided 2.x -> 3.x upgrade (options flow) is flashing this display;
+        # a 2.x image now would undo it.
+        if self.hass.data.get(DATA_FIRMWARE_UPGRADES) and (
+            self._entry.entry_id in self.hass.data[DATA_FIRMWARE_UPGRADES]
+        ):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="firmware_upgrade_running",
+            )
 
         asset_name = firmware_ota_asset(self._ic_type, tag)
         if asset_name is None:
@@ -323,119 +484,13 @@ class OpenDisplayFirmwareUpdateEntity(
                 self._attr_in_progress = new_pct
                 self.async_write_ha_state()
 
-        def _on_log(msg: str) -> None:
-            _LOGGER.debug("OTA: %s", msg)
-
-        # Bound to the OTA deadline block so its .expired() distinguishes a
-        # deadline breach from an unrelated TimeoutError (e.g. an aiohttp download
-        # total-timeout, which is a bare TimeoutError, not an aiohttp.ClientError).
-        ota_deadline: asyncio.Timeout | None = None
         try:
             firmware_bytes = await self._download_asset(tag, asset_name)
-
-            ble_device = async_ble_device_from_address(
-                self.hass, self._ble_address, connectable=True
+            await async_flash_silabs(
+                self.hass, self._entry, firmware_bytes, on_progress=_on_progress
             )
-            if ble_device is None:
-                raise HomeAssistantError(
-                    "Device not reachable over Bluetooth; bring it within range and retry"
-                )
-
-            # Hold the per-MAC BLE lock across the whole OTA (DFU trigger +
-            # AppLoader flash) so a drawcustom/upload/LED/buzzer service call on
-            # this tag can't open an overlapping connection mid-flash. This op
-            # only takes the lock here — it never calls back into a locked
-            # service op — so there is no re-entrant deadlock. The download above
-            # runs outside the lock so it doesn't block other BLE ops needlessly.
-            # Bound the BLE work with a wall-clock deadline so a device that keeps
-            # half-connecting can't hold the lock forever (OTA_INSTALL_DEADLINE_S).
-            async with (
-                asyncio.timeout(OTA_INSTALL_DEADLINE_S) as ota_deadline,
-                ble_connection(self._ble_address, "firmware update (OTA)"),
-            ):
-                # Only EFR32BG22 (Silabs AppLoader) is flashed over BLE here — see
-                # _OTA_INSTALL_IC_TYPES. The device is either in app mode (and needs
-                # the DFU trigger) or already in the AppLoader at the same address (a
-                # previous OTA was interrupted, or it browned out before committing).
-                # Try to trigger from app mode, but tolerate the connect failing —
-                # then the device is already in the AppLoader and we flash it
-                # directly, so HA can recover a stuck device instead of failing hard.
-                # A stale proxy GATT cache from a prior interrupted OTA is handled at
-                # the connection layer: BLEConnection.connect() clears it and retries.
-                try:
-                    _on_log("Connecting to trigger DFU bootloader…")
-                    async with OpenDisplayDevice(
-                        mac_address=self._ble_address,
-                        ble_device=ble_device,
-                        encryption_key=_get_encryption_key(self._entry),
-                    ) as device:
-                        # Clear the (now fresh) app-mode GATT from the proxy cache so
-                        # the post-reboot AppLoader connection re-discovers the OTA
-                        # service instead of these app-firmware handles.
-                        cleared = await device.clear_gatt_cache()
-                        _on_log(f"Proxy GATT cache clear requested: {cleared}")
-                        await device.trigger_dfu_bootloader()
-                except BLEConnectionError as err:
-                    _on_log(
-                        f"App-mode connect failed ({err}); device is likely already "
-                        "in the AppLoader — attempting OTA directly."
-                    )
-
-                # AppLoader advertises at the same address; perform_silabs_ota
-                # retries the connection internally until it is ready.
-                ota_device = async_ble_device_from_address(
-                    self.hass, self._ble_address, connectable=True
-                )
-                if ota_device is None:
-                    raise HomeAssistantError(
-                        "Device not reachable in OTA mode; bring it within range and retry"
-                    )
-                await perform_silabs_ota(
-                    firmware_bytes,
-                    ota_device,
-                    on_progress=_on_progress,
-                    on_log=_on_log,
-                )
-
-                self._attr_installed_version = tag
-                _LOGGER.info("Firmware updated to %s", tag)
-
-        except TimeoutError as err:
-            # Only relabel when our OTA deadline actually fired; re-raise any other
-            # TimeoutError (e.g. a download total-timeout) with its true cause.
-            if ota_deadline is not None and ota_deadline.expired():
-                raise HomeAssistantError(
-                    f"Firmware update timed out after {OTA_INSTALL_DEADLINE_S:.0f}s"
-                ) from err
-            raise
-        except (AuthenticationFailedError, AuthenticationRequiredError) as err:
-            # The app-mode connect for the DFU trigger authenticates with the
-            # stored key. An auth failure here is a subclass of OpenDisplayError,
-            # not OTAError/BLEConnectionError, so without this it would leak as a
-            # raw exception with no reauth. Start reauth and surface the standard
-            # auth message.
-            _LOGGER.warning(
-                "%s: device rejected the encryption key during OTA (%s); "
-                "reauthentication required",
-                self._ble_address,
-                err,
-            )
-            self._entry.async_start_reauth(self.hass)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="authentication_error",
-            ) from err
-        except ConfigEntryAuthFailed as err:
-            # Malformed stored key — already logged at ERROR in _get_encryption_key.
-            # Convert to reauth + the standard auth message (a raw ConfigEntryAuthFailed
-            # from an entity method does not auto-trigger reauth).
-            self._entry.async_start_reauth(self.hass)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="authentication_error",
-            ) from err
-        except (OTAError, BLEConnectionError) as err:
-            raise HomeAssistantError(f"Firmware update failed: {err}") from err
+            self._attr_installed_version = tag
+            _LOGGER.info("Firmware updated to %s", tag)
         finally:
             self._installing = False
             self._attr_in_progress = False

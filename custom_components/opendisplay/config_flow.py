@@ -20,6 +20,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.selector import (
     BooleanSelector,
     NumberSelector,
@@ -75,6 +76,9 @@ from .const import (
 )
 from .refresh_modes import experimental_enabled, selectable_modes
 from .transport import note_mdns_seen
+
+if TYPE_CHECKING:
+    from .firmware_v3 import Preflight, UpgradeJob
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -548,18 +552,239 @@ class OpenDisplayOptionsFlow(OptionsFlowWithReload):
     two is disallowed).
     """
 
+    _upgrade_task: asyncio.Task[Any] | None = None
+    _preflight: Preflight | None = None
+    _job: UpgradeJob | None = None
+    _refusal: tuple[str, dict[str, str]] | None = None
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the deep-sleep options."""
+        """Manage the options; a BG22 on 2.x also offers the 3.x upgrade."""
+        from .firmware_v3 import upgrade_supported
+
+        if user_input is None and upgrade_supported(self.config_entry):
+            return self.async_show_menu(
+                step_id="init", menu_options=["settings", "firmware_v3"]
+            )
+        return await self._async_settings("init", user_input)
+
+    async def async_step_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the deep-sleep, refresh-mode and update options."""
+        return await self._async_settings("settings", user_input)
+
+    async def _async_settings(
+        self, step_id: str, user_input: dict[str, Any] | None
+    ) -> ConfigFlowResult:
         if user_input is not None:
             return self.async_create_entry(data=user_input)
 
         return self.async_show_form(
-            step_id="init",
+            step_id=step_id,
             data_schema=self.add_suggested_values_to_schema(
                 _options_schema(self._drive_modes()), self.config_entry.options
             ),
+        )
+
+    # --- guided firmware 3.x upgrade (firmware_v3.py) -----------------------
+    #
+    # firmware_v3 (explain) -> firmware_v3_check (progress: release + pre-flight)
+    # -> firmware_v3_confirm[_untested] -> firmware_v3_flash (progress)
+    # -> firmware_v3_migrate (progress) -> abort with the outcome. Every
+    # refusal ends in an abort whose text says what happened and where the
+    # backup is.
+
+    async def async_step_firmware_v3(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Explain the upgrade; nothing touches the display before the user continues."""
+        if user_input is None:
+            return self.async_show_form(
+                step_id="firmware_v3",
+                description_placeholders={"name": self.config_entry.title},
+            )
+        return await self.async_step_firmware_v3_check()
+
+    async def async_step_firmware_v3_check(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Find the 3.x image, back up the 2.x config and plan the migration."""
+        from .firmware_v3 import (
+            UpgradeRefusedError,
+            async_find_release,
+            async_preflight,
+            stranded_preflight,
+        )
+
+        async def _check() -> Preflight:
+            # A previous flash broke off in the AppLoader: the app cannot be
+            # reached for a new pre-flight, and its config is still the one
+            # this pre-flight saved and planned for.
+            if stranded := stranded_preflight(self.hass, self.config_entry):
+                return stranded
+            release = await async_find_release(self.hass, self.config_entry)
+            return await async_preflight(self.hass, self.config_entry, release)
+
+        if self._upgrade_task is None:
+            self._upgrade_task = self.hass.async_create_task(_check())
+        if not self._upgrade_task.done():
+            return self.async_show_progress(
+                step_id="firmware_v3_check",
+                progress_action="firmware_v3_check",
+                progress_task=self._upgrade_task,
+            )
+        task, self._upgrade_task = self._upgrade_task, None
+        try:
+            self._preflight = task.result()
+        except UpgradeRefusedError as err:
+            self._refusal = (err.reason, err.placeholders)
+            return self.async_show_progress_done(next_step_id="firmware_v3_result")
+        except Exception:
+            # Nothing was flashed; end here rather than re-running the check.
+            _LOGGER.exception("Firmware 3.x upgrade check failed")
+            self._refusal = ("unknown", {})
+            return self.async_show_progress_done(next_step_id="firmware_v3_result")
+        next_step = (
+            "firmware_v3_confirm_untested"
+            if self._preflight.plan.needs_confirmation
+            else "firmware_v3_confirm"
+        )
+        return self.async_show_progress_done(next_step_id=next_step)
+
+    async def async_step_firmware_v3_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Flash once the user confirms what the pre-flight found."""
+        return await self._async_confirm_upgrade("firmware_v3_confirm", user_input)
+
+    async def async_step_firmware_v3_confirm_untested(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Flash a panel whose 3.x drive data nobody has watched draw yet."""
+        return await self._async_confirm_upgrade(
+            "firmware_v3_confirm_untested", user_input
+        )
+
+    async def _async_confirm_upgrade(
+        self, step_id: str, user_input: dict[str, Any] | None
+    ) -> ConfigFlowResult:
+        preflight = self._preflight
+        assert preflight is not None
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if user_input.get("confirm"):
+                return await self.async_step_firmware_v3_flash()
+            errors["base"] = "confirm_required"
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=vol.Schema(
+                {vol.Required("confirm", default=False): BooleanSelector()}
+            ),
+            description_placeholders={
+                "name": self.config_entry.title,
+                "version": preflight.release.tag,
+                "panel": preflight.panel,
+                "size": str(preflight.config_bytes),
+                "backup": str(preflight.backup),
+            },
+            errors=errors,
+        )
+
+    async def async_step_firmware_v3_flash(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Download and flash the 3.x image over BLE."""
+        from .firmware_v3 import (
+            UpgradeRefusedError,
+            async_start_upgrade,
+            async_wait_flashed,
+            flash_error_placeholders,
+        )
+
+        preflight = self._preflight
+        assert preflight is not None
+        if self._job is None:
+
+            def _on_progress(pct: float) -> None:
+                self.async_update_progress(min(max(pct / 100, 0.0), 1.0))
+
+            self._job = async_start_upgrade(
+                self.hass, self.config_entry, preflight, _on_progress
+            )
+        job = self._job
+        if self._upgrade_task is None:
+            self._upgrade_task = self.hass.async_create_task(async_wait_flashed(job))
+        if not self._upgrade_task.done():
+            return self.async_show_progress(
+                step_id="firmware_v3_flash",
+                progress_action="firmware_v3_flash",
+                description_placeholders={"version": preflight.release.tag},
+                progress_task=self._upgrade_task,
+            )
+        self._upgrade_task = None
+        if job.flashed.is_set():
+            return self.async_show_progress_done(next_step_id="firmware_v3_migrate")
+        err = job.task.exception() if not job.task.cancelled() else None
+        if isinstance(err, UpgradeRefusedError):
+            self._refusal = (
+                err.reason,
+                {**err.placeholders, "backup": str(preflight.backup)},
+            )
+        else:
+            # The entry stays loaded on its 2.x data, so the upgrade can be
+            # opened again to retry; the flash tolerates a display already
+            # sitting in the AppLoader.
+            self._refusal = flash_error_placeholders(
+                err
+                if isinstance(err, HomeAssistantError)
+                else HomeAssistantError(str(err)),
+                preflight,
+            )
+        return self.async_show_progress_done(next_step_id="firmware_v3_result")
+
+    async def async_step_firmware_v3_migrate(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Wait for the display on 3.x, then write and verify its drive data."""
+        from .firmware_v3 import UpgradeRefusedError, async_wait_done
+
+        preflight, job = self._preflight, self._job
+        assert preflight is not None
+        assert job is not None
+        if self._upgrade_task is None:
+            self._upgrade_task = self.hass.async_create_task(async_wait_done(job))
+        if not self._upgrade_task.done():
+            return self.async_show_progress(
+                step_id="firmware_v3_migrate",
+                progress_action="firmware_v3_migrate",
+                progress_task=self._upgrade_task,
+            )
+        self._upgrade_task = None
+        err = job.task.exception() if not job.task.cancelled() else None
+        if isinstance(err, UpgradeRefusedError):
+            self._refusal = (err.reason, err.placeholders)
+        elif err is not None:
+            self._refusal = (
+                "migrate_failed",
+                {"error": str(err), "backup": str(preflight.backup)},
+            )
+        else:
+            self._refusal = (
+                "firmware_v3_done",
+                {"version": preflight.release.tag, "backup": str(preflight.backup)},
+            )
+        return self.async_show_progress_done(next_step_id="firmware_v3_result")
+
+    async def async_step_firmware_v3_result(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """End the upgrade with what happened."""
+        reason, placeholders = self._refusal or ("unknown", {})
+        return self.async_abort(
+            reason=reason,
+            description_placeholders={"name": self.config_entry.title, **placeholders},
         )
 
     def _drive_modes(self) -> list[str] | None:

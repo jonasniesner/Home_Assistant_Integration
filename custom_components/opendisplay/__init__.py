@@ -48,6 +48,7 @@ from .const import (
     CONF_CACHED_STATE,
     CONF_DEFAULT_DRIVE_MODE,
     CONF_ENCRYPTION_KEY,
+    DATA_FIRMWARE_UPGRADES,
     DOMAIN,
     SETUP_DEADLINE_S,
 )
@@ -448,6 +449,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
         window; route to an opportunistic config resync instead. Non-sleepy
         devices keep the reload behavior.
         """
+        if entry.entry_id in hass.data.get(DATA_FIRMWARE_UPGRADES, set()):
+            # The guided 3.x upgrade reboots the display on purpose and reloads
+            # the entry itself when it is done.
+            return
         if profile.is_sleepy:
             manager.request_config_resync()
         else:
