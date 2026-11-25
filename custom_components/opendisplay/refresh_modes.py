@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+import base64
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -45,7 +46,8 @@ from opendisplay.models.lut_assemble import assemble_subset_s6
 from opendisplay.models.lut_lint import mode_problem
 from opendisplay.models.panel_drive import LUT_SLOT_NONE, DisplayMode
 from opendisplay.panels.drive_plan import DrivePlan, plan_drive, record_drive
-from opendisplay.panels.drive_state import DriveState
+from opendisplay.panels.drive_state import DriveState, drive_fingerprint
+from opendisplay.panels.prior import PriorConflictError
 
 from .const import (
     CONF_EXPERIMENTAL_MODES,
@@ -219,7 +221,12 @@ class RefreshModeStore:
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.refresh_modes.{entry_id}"
         )
-        self._data: dict[str, Any] = {"selected": None, "devices": {}, "last_run": None}
+        self._data: dict[str, Any] = {
+            "selected": None,
+            "devices": {},
+            "last_run": None,
+            "priors": {},
+        }
 
     async def async_load(self) -> None:
         """Load the stored document; a missing or malformed one starts empty."""
@@ -234,6 +241,9 @@ class RefreshModeStore:
                 "last_run": stored.get("last_run")
                 if isinstance(stored.get("last_run"), dict)
                 else None,
+                "priors": stored.get("priors")
+                if isinstance(stored.get("priors"), dict)
+                else {},
             }
 
     async def async_flush(self) -> None:
@@ -264,6 +274,34 @@ class RefreshModeStore:
     def forget(self, name: str) -> None:
         """Drop the drive state of ``name``; its next costed drive starts with a stock full."""
         if self._data["devices"].pop(name, None) is not None:
+            self._schedule_save()
+
+    # -- prior frame (what the panel shows now) -----------------------------
+
+    def get_prior(self, name: str, fingerprint: str) -> bytes | None:
+        """The frame the panel shows now, when it was recorded against these drive packets."""
+        raw = self._data["priors"].get(name)
+        if not isinstance(raw, dict) or raw.get("fingerprint") != fingerprint:
+            return None
+        try:
+            return base64.b64decode(raw["frame"])
+        except KeyError, TypeError, ValueError:
+            return None
+
+    def put_prior(self, name: str, fingerprint: str, frame: bytes | None) -> None:
+        """Record the frame the panel shows now (None = unknown)."""
+        if frame is None:
+            self.forget_prior(name)
+            return
+        self._data["priors"][name] = {
+            "fingerprint": fingerprint,
+            "frame": base64.b64encode(frame).decode(),
+        }
+        self._schedule_save()
+
+    def forget_prior(self, name: str) -> None:
+        """The panel's content is unknown (a plain upload, or a failed drive)."""
+        if self._data["priors"].pop(name, None) is not None:
             self._schedule_save()
 
     # -- selection and last run --------------------------------------------
@@ -487,6 +525,46 @@ def plan_upload(
     return plan, state, temp_c
 
 
+async def _show(
+    device: Device,
+    request: DriveRequest,
+    name: str,
+    tables: dict[int, bytes] | None,
+    prior: bytes | None,
+) -> int | None:
+    """One drive upload; library errors become RefreshModeError (PriorConflictError passes)."""
+    try:
+        return await device.display.show(
+            request.image,
+            mode=name,
+            dither_mode=request.dither_mode,
+            fit=request.fit,
+            rotate=request.rotate,
+            use_measured_palettes=request.use_measured_palettes,
+            compress=request.compress,
+            inline_luts=tables,
+            prior=prior,
+        )
+    except DriveModeSubstitutedError as err:
+        raise RefreshModeError(
+            f"The display runs mode {err.actual} instead of '{name}'"
+            f"{f' at {err.temp_c} °C' if err.temp_c is not None else ''}; nothing was uploaded"
+        ) from err
+    except InvalidResponseError as err:
+        if tables and _UNSUPPORTED_NACK in str(err):
+            raise RefreshModeError(
+                f"The display refused the inline table for '{name}': its "
+                "firmware does not accept INLINE_LUT"
+            ) from err
+        raise
+    except PriorConflictError:
+        raise
+    except ValueError as err:
+        raise RefreshModeError(
+            f"Drive mode '{name}' was refused before sending: {err}"
+        ) from err
+
+
 async def async_drive_upload(
     hass: HomeAssistant,
     entry: OpenDisplayConfigEntry,
@@ -522,41 +600,44 @@ async def async_drive_upload(
 
     store = _store(entry)
     key = _device_key(entry)
+    fingerprint = drive_fingerprint(config)
+    prior = store.get_prior(key, fingerprint)
     ran: list[str] = []
+    driven: int | None = None
     for step in plan.steps:
-        tables = inline.get(step.mode_index)
+        step_mode = _mode_by_index(config, step.mode_index)
+        name = step.name
+        use_prior = (
+            prior
+            if step_mode.ext is not None and step_mode.ext.hold_codes
+            else None
+        )
+        if step_mode.ext is not None and step_mode.ext.hold_codes and prior is None:
+            # Unknown panel content: a hold-code mode would drive every pixel; draw stock.
+            stock = stock_mode(config)
+            if stock is not None:
+                name, step_mode = stock.name, stock
+        tables = inline.get(step_mode.mode_index)
+        store.forget_prior(key)
         try:
-            temp_c = await device.display.show(
-                request.image,
-                mode=step.name,
-                dither_mode=request.dither_mode,
-                fit=request.fit,
-                rotate=request.rotate,
-                use_measured_palettes=request.use_measured_palettes,
-                compress=request.compress,
-                inline_luts=tables,
-            )
-        except DriveModeSubstitutedError as err:
-            raise RefreshModeError(
-                f"The display runs mode {err.actual} instead of '{step.name}'"
-                f"{f' at {err.temp_c} °C' if err.temp_c is not None else ''}; nothing was uploaded"
-            ) from err
-        except InvalidResponseError as err:
-            if tables and _UNSUPPORTED_NACK in str(err):
-                raise RefreshModeError(
-                    f"The display refused the inline table for '{step.name}': its "
-                    "firmware does not accept INLINE_LUT"
-                ) from err
-            raise
-        except ValueError as err:
-            raise RefreshModeError(
-                f"Drive mode '{step.name}' was refused before sending: {err}"
-            ) from err
-        ran.append(step.name)
-        state = record_drive(config, state, step.mode_index, temp_c)
+            temp_c = await _show(device, request, name, tables, use_prior)
+        except PriorConflictError as err:
+            stock = stock_mode(config)
+            if stock is None:
+                raise RefreshModeError(str(err)) from err
+            _LOGGER.info("%s: %s; drawing stock '%s'", entry.unique_id, err, stock.name)
+            name, step_mode = stock.name, stock
+            temp_c = await _show(device, request, name, None, None)
+        frame = getattr(device.display, "last_frame", None)
+        prior = bytes(frame) if isinstance(frame, (bytes, bytearray)) else None
+        changed = getattr(device.display, "last_changed", None)
+        driven = changed if isinstance(changed, int) else None
+        store.put_prior(key, fingerprint, prior)
+        ran.append(name)
+        state = record_drive(config, state, step_mode.mode_index, temp_c)
         store.put(key, state)
 
-    chosen = plan.steps[-1].name
+    chosen = ran[-1]
     requested = _mode_by_index(config, plan.requested).name
     run = DriveRun(
         requested=requested,
@@ -565,10 +646,11 @@ async def async_drive_upload(
         temp_c=temp_c,
         budget_used=state.budget_used if state is not None else None,
         budget_limit=_budget_limit(config),
-        substituted=plan.chosen != plan.requested,
+        substituted=plan.chosen != plan.requested or chosen != plan.steps[-1].name,
         stock_full_first=plan.stock_full_first,
         near_edge=plan.near_edge,
-        notes=plan.notes,
+        notes=plan.notes
+        + ((f"prior: drove {driven} changed pixels",) if driven is not None else ()),
         reasons=tuple(step.reason for step in plan.steps),
     )
     _publish(entry, hass, run)
@@ -596,6 +678,9 @@ def record_plain_upload(
     A full refresh runs mode 0, which resets the budget; a fast refresh runs the
     mode named "fast" when the config declares one. Partial updates change nothing.
     """
+    if entry.runtime_data.refresh_modes is not None:
+        # A plain upload's frame is not kept, so the panel content is unknown from now on.
+        _store(entry).forget_prior(_device_key(entry))
     modes = display_modes(config)
     if not modes or entry.runtime_data.refresh_modes is None:
         return
