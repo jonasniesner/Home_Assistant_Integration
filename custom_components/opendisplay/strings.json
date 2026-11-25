@@ -76,8 +76,79 @@
           "github_token": "Used only for the firmware update checks against the GitHub API, and applies to every OpenDisplay device. Without a token, all devices and other tools on the same network share GitHub's limit of 60 requests per hour. A fine-grained token with no extra permissions (public repositories, read-only) raises it to 5,000. Leave empty to stay anonymous.",
           "experimental_refresh_modes": "EXPERIMENTAL, for desk testing. Offers the drive modes this display's configuration marks as experimental (faster or custom waveforms) in the service mode field, the default drive mode and the drive preset update. They are not validated on every panel and can leave ghosting or wrong colours; Home Assistant inserts a stock full refresh when the panel's budget runs out.",
           "default_drive_mode": "The drive mode uploads run in when a call names none. Empty = the stock full refresh. Lists this display's modes (experimental ones after enabling them and reopening this form)."
+        },
+        "title": "Options",
+        "menu_options": {
+          "settings": "Settings",
+          "firmware_v3": "Upgrade to firmware 3.x"
+        }
+      },
+      "settings": {
+        "data": {
+          "sleep_mode": "Deep sleep handling",
+          "missed_cycles": "Missed wake cycles before unavailable",
+          "queue_timeout_hours": "Queued content timeout (hours)",
+          "probe_before_queue": "Try connecting before queueing",
+          "github_token": "GitHub token (optional)",
+          "experimental_refresh_modes": "Enable experimental refresh modes",
+          "default_drive_mode": "Default drive mode"
+        },
+        "data_description": {
+          "sleep_mode": "Automatic follows the device's own power configuration (battery power with deep sleep enabled). Force on or off to override.",
+          "missed_cycles": "How many expected wake-ups the device may miss before its entities are marked unavailable.",
+          "queue_timeout_hours": "How long content queued for a sleeping device waits for a wake before it expires.",
+          "probe_before_queue": "Before queueing an image for a sleeping device, make one quick connection attempt in case it is actually awake (missed advertisements, always-on radios). Adds at most a few seconds when the device really is asleep.",
+          "github_token": "Used only for the firmware update checks against the GitHub API, and applies to every OpenDisplay device. Without a token, all devices and other tools on the same network share GitHub's limit of 60 requests per hour. A fine-grained token with no extra permissions (public repositories, read-only) raises it to 5,000. Leave empty to stay anonymous.",
+          "experimental_refresh_modes": "EXPERIMENTAL, for desk testing. Offers the drive modes this display's configuration marks as experimental (faster or custom waveforms) in the service mode field, the default drive mode and the drive preset update. They are not validated on every panel and can leave ghosting or wrong colours; Home Assistant inserts a stock full refresh when the panel's budget runs out.",
+          "default_drive_mode": "The drive mode uploads run in when a call names none. Empty = the stock full refresh. Lists this display's modes (experimental ones after enabling them and reopening this form)."
+        }
+      },
+      "firmware_v3": {
+        "title": "Upgrade {name} to firmware 3.x",
+        "description": "Firmware 3.x drives the panel from drive data in the configuration. The 2.x configuration of {name} has none, so after the update it draws nothing until that drive data is written. This upgrade does both steps:\n\n1. Check: find the newest 3.x release, connect to {name}, save its configuration to `opendisplay/backups` in your configuration folder, and check that firmware 3.x has drive data for its panel that fits. Nothing is flashed if that fails.\n2. After you confirm: flash firmware 3.x over Bluetooth (a few minutes), wait for {name} to restart, then write and verify the drive data.\n\nKeep {name} awake, powered and in range until the upgrade ends. Going back to 2.x needs a manual flash."
+      },
+      "firmware_v3_confirm": {
+        "title": "Flash firmware {version} to {name}?",
+        "description": "The check passed.\n\n- Firmware: {version} (Firmware_Unified, checked against its release manifest)\n- Drive data: {panel}\n- Configuration after the migration: {size} bytes\n- Backup of the 2.x configuration: `{backup}`\n\nThe flash takes a few minutes. Do not move {name} out of range or remove its power. If the flash breaks off, {name} may stay in its bootloader: open this upgrade again to retry the flash.",
+        "data": {
+          "confirm": "Flash firmware {version} now"
+        }
+      },
+      "firmware_v3_confirm_untested": {
+        "title": "Flash firmware {version} to {name}?",
+        "description": "The check passed.\n\n- Firmware: {version} (Firmware_Unified, checked against its release manifest)\n- Drive data: {panel}\n- Configuration after the migration: {size} bytes\n- Backup of the 2.x configuration: `{backup}`\n\n**Untested:** this drive data repeats what firmware 2.x sent to {panel}, but nobody has confirmed yet that it draws correctly with firmware 3.x. If it does not, {name} needs a manual flash back to 2.x and the backup restored.\n\nThe flash takes a few minutes. Do not move {name} out of range or remove its power. If the flash breaks off, {name} may stay in its bootloader: open this upgrade again to retry the flash.",
+        "data": {
+          "confirm": "Flash firmware {version} now"
         }
       }
+    },
+    "error": {
+      "confirm_required": "Tick the box to confirm the flash."
+    },
+    "progress": {
+      "firmware_v3_check": "Finding the 3.x release, saving the configuration and checking the drive data…",
+      "firmware_v3_flash": "Flashing firmware {version} over Bluetooth. This takes a few minutes; keep the display powered and in range.",
+      "firmware_v3_migrate": "Waiting for the display to restart on firmware 3.x, then writing its drive data…"
+    },
+    "abort": {
+      "release_lookup_failed": "Could not look up the firmware 3.x releases: {error}. Nothing was changed.",
+      "no_release": "No published firmware 3.x release offers an upgrade from 2.x for this display yet. Nothing was changed.",
+      "device_sleeping": "{name} is in deep sleep. Wake it (or turn deep sleep off in these options) and start the upgrade again. Nothing was flashed.",
+      "cannot_connect": "Could not reach {name}. Wake it, bring it in range and start the upgrade again. Nothing was flashed.",
+      "already_v3": "{name} already runs firmware 3.x. If it draws nothing, use the repair \"{name} cannot draw its panel\".",
+      "no_config": "{name} has no display configuration to migrate. Configure it with the OpenDisplay toolbox first. Nothing was flashed.",
+      "backup_failed": "The configuration of {name} could not be saved: {error}. Nothing was flashed.",
+      "unsupported": "Firmware 3.x cannot drive this panel yet, so {name} would draw nothing after the update. Nothing was flashed; {name} stays on 2.x.\n\n{reason}\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "too_large": "With the drive data the configuration of {name} needs {size} bytes, but firmware 3.x on this chip stores at most {limit}. Nothing was flashed; {name} stays on 2.x.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "download_failed": "The firmware could not be downloaded: {error}. Nothing was flashed.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "firmware_corrupt": "The downloaded `{file}` does not match the release manifest (size or SHA-256). Nothing was flashed.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "flash_failed": "The flash did not start: {error}. {name} should still run firmware 2.x; start the upgrade again when it is in range.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "flash_failed_apploader": "The flash broke off: {error}.\n\n{name} may now be waiting in its bootloader (AppLoader) and not advertising as a display; its configuration is kept. Bring it close and open this upgrade again to retry the flash: Home Assistant flashes a display that sits in the bootloader directly. If Home Assistant was restarted in between, flash it with the OpenDisplay tools instead.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "not_back": "Firmware 3.x was flashed, but {name} did not answer on firmware 3.x within {minutes} minutes. When it does, Home Assistant shows the repair \"{name} cannot draw its panel\" to add its drive data.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "still_v2": "The flash ended, but {name} still reports firmware 2.x, so the bootloader did not take the image. Start the upgrade again.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "migrate_failed": "Firmware 3.x was flashed, but the drive data was not written: {error}. {name} draws nothing until it is: open the repair \"{name} cannot draw its panel\" to try again.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "firmware_v3_done": "{name} now runs firmware {version} and has the drive data for its panel. Check it with the next upload.\n\nThe 2.x configuration of {name} was saved, without its key, WiFi password and FindMy keys, to `{backup}`.",
+      "unknown": "The upgrade stopped for an unexpected reason; see the log."
     }
   },
   "entity": {
@@ -226,6 +297,9 @@
     },
     "refresh_mode_refused": {
       "message": "Refresh mode \"{mode}\" cannot run: {error}"
+    },
+    "firmware_upgrade_running": {
+      "message": "The upgrade to firmware 3.x is running on this display; wait for it to finish."
     }
   },
   "selector": {
@@ -585,6 +659,29 @@
         },
         "abort": {
           "cannot_connect": "Could not reach {name}. Wake it, then open this repair again."
+        }
+      }
+    },
+    "needs_migration_after_upgrade": {
+      "title": "{name} cannot draw its panel",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Add drive data to {name}",
+            "description": "{name} was upgraded to firmware 3.x, but its drive data was not written, so it draws nothing. The 2.x configuration from before the upgrade is in `{backup}`.\n\nHome Assistant writes the drive data for {panel} to the configuration of {name} and keeps everything else. It first saves another backup of the current configuration in `opendisplay/backups` in your configuration folder.\n\nKeep {name} awake and in range. Some panels redraw for about 30 seconds after the write."
+          },
+          "confirm_untested": {
+            "title": "Add untested drive data to {name}",
+            "description": "{name} was upgraded to firmware 3.x, but its drive data was not written, so it draws nothing. The 2.x configuration from before the upgrade is in `{backup}`.\n\nHome Assistant writes the drive data for {panel} to the configuration of {name} and keeps everything else. It first saves another backup of the current configuration in `opendisplay/backups` in your configuration folder.\n\nKeep {name} awake and in range. Some panels redraw for about 30 seconds after the write.\n\n**Untested:** this drive data repeats what firmware 2.x sent to {panel}, but nobody has confirmed yet that it draws correctly with firmware 3.0. Check the display after the next upload, and keep the backup."
+          }
+        },
+        "error": {
+          "cannot_connect": "Could not reach the display. Wake it and try again.",
+          "write_failed": "The configuration could not be written, or it did not read back as written. The 2.x configuration from before the upgrade is in `{backup}`."
+        },
+        "abort": {
+          "cannot_connect": "Could not reach {name}. Wake it, then open this repair again.",
+          "migration_blocked": "Home Assistant cannot add the drive data: {reason}. The 2.x configuration from before the upgrade is in `{backup}`."
         }
       }
     }

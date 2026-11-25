@@ -2,7 +2,12 @@
 
 from datetime import timedelta
 
+from homeassistant.util.hass_dict import HassKey
+
 DOMAIN = "opendisplay"
+# Entry ids whose display a guided 2.x -> 3.x upgrade (firmware_v3.py) is flashing or
+# migrating: the update entity refuses to flash and a reboot does not reload the entry.
+DATA_FIRMWARE_UPGRADES: HassKey[set[str]] = HassKey(f"{DOMAIN}_firmware_upgrades")
 CONF_ENCRYPTION_KEY = "encryption_key"
 # Firmware 3.0 keys that are not confirmed yet (a rotation cut short), newest last,
 # and the device uid the confirmed key is bound to (SECURITY_V2 § 4.3, § 8.8).

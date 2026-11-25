@@ -174,22 +174,42 @@ def needs_migration_issue_id(entry: ConfigEntry) -> str:
 
 @callback
 def async_update_needs_migration_issue(
-    hass: HomeAssistant, entry: ConfigEntry, needs_migration: bool
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    needs_migration: bool,
+    *,
+    backup: str | None = None,
 ) -> None:
-    """Raise the issue while the display cannot draw its panel, and remove it after."""
+    """Raise the issue while the display cannot draw its panel, and remove it after.
+
+    ``backup`` is the 2.x config saved before a guided firmware 3.x upgrade whose
+    migration did not finish; once given it is kept while the issue stays open,
+    so a later setup re-raising the issue still points at it.
+    """
     issue_id = needs_migration_issue_id(entry)
     if not needs_migration:
         ir.async_delete_issue(hass, DOMAIN, issue_id)
         return
+    if backup is None and (
+        existing := ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
+    ):
+        backup = (existing.data or {}).get("backup")
+    data: dict[str, str | int | float | None] = {"entry_id": entry.entry_id}
+    placeholders = {"name": entry.title}
+    if backup is not None:
+        data["backup"] = backup
+        placeholders["backup"] = backup
     ir.async_create_issue(
         hass,
         DOMAIN,
         issue_id,
         is_fixable=True,
         severity=ir.IssueSeverity.ERROR,
-        translation_key="needs_migration",
-        translation_placeholders={"name": entry.title},
-        data={"entry_id": entry.entry_id},
+        translation_key="needs_migration_after_upgrade"
+        if backup is not None
+        else "needs_migration",
+        translation_placeholders=placeholders,
+        data=data,
     )
 
 
@@ -239,9 +259,10 @@ def _panel_name(plan: MigrationPlan) -> str:
 class NeedsMigrationRepairFlow(RepairsFlow):
     """Add the panel's drive data to the display's config, after a backup."""
 
-    def __init__(self, entry_id: str) -> None:
-        """Remember which entry's display to migrate."""
+    def __init__(self, entry_id: str, backup: str | None = None) -> None:
+        """Remember which entry's display to migrate (and its pre-upgrade backup)."""
         self._entry_id = entry_id
+        self._extra = {"backup": backup} if backup is not None else {}
         self._placeholders: dict[str, str] = {}
 
     async def async_step_init(
@@ -255,7 +276,8 @@ class NeedsMigrationRepairFlow(RepairsFlow):
             plan = await async_plan_migration(self.hass, entry)
         except MigrationUnavailableError:
             return self.async_abort(
-                reason="cannot_connect", description_placeholders={"name": entry.title}
+                reason="cannot_connect",
+                description_placeholders={"name": entry.title, **self._extra},
             )
         if not plan.needed:
             self.hass.config_entries.async_schedule_reload(entry.entry_id)
@@ -263,9 +285,13 @@ class NeedsMigrationRepairFlow(RepairsFlow):
         if plan.blocked:
             return self.async_abort(
                 reason="migration_blocked",
-                description_placeholders={"reason": plan.reason},
+                description_placeholders={"reason": plan.reason, **self._extra},
             )
-        self._placeholders = {"name": entry.title, "panel": _panel_name(plan)}
+        self._placeholders = {
+            "name": entry.title,
+            "panel": _panel_name(plan),
+            **self._extra,
+        }
         if plan.needs_confirmation:
             return await self.async_step_confirm_untested()
         return await self.async_step_confirm()
@@ -507,7 +533,10 @@ async def async_create_fix_flow(
     assert data is not None
     entry_id = str(data["entry_id"])
     if issue_id.startswith(_NEEDS_MIGRATION_PREFIX):
-        return NeedsMigrationRepairFlow(entry_id)
+        backup = data.get("backup")
+        return NeedsMigrationRepairFlow(
+            entry_id, str(backup) if backup is not None else None
+        )
     if issue_id.startswith(_PRESET_UPDATE_PREFIX):
         return PresetUpdateRepairFlow(entry_id)
     return KeyRotatedRepairFlow(entry_id)
