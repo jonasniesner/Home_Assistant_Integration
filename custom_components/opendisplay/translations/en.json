@@ -65,7 +65,8 @@
                     "queue_timeout_hours": "Queued content timeout (hours)",
                     "probe_before_queue": "Try connecting before queueing",
                     "github_token": "GitHub token (optional)",
-                    "experimental_refresh_modes": "Enable experimental refresh modes"
+                    "experimental_refresh_modes": "Enable experimental refresh modes",
+                    "default_drive_mode": "Default drive mode"
                 },
                 "data_description": {
                     "sleep_mode": "Automatic follows the device's own power configuration (battery power with deep sleep enabled). Force on or off to override.",
@@ -73,7 +74,8 @@
                     "queue_timeout_hours": "How long content queued for a sleeping device waits for a wake before it expires.",
                     "probe_before_queue": "Before queueing an image for a sleeping device, make one quick connection attempt in case it is actually awake (missed advertisements, always-on radios). Adds at most a few seconds when the device really is asleep.",
                     "github_token": "Used only for the firmware update checks against the GitHub API, and applies to every OpenDisplay device. Without a token, all devices and other tools on the same network share GitHub's limit of 60 requests per hour. A fine-grained token with no extra permissions (public repositories, read-only) raises it to 5,000. Leave empty to stay anonymous.",
-                    "experimental_refresh_modes": "EXPERIMENTAL, for desk testing. Offers the drive modes this display's configuration marks as experimental (faster or custom waveforms) in the Refresh mode select, the service mode field and the drive preset update. They are not validated on every panel and can leave ghosting or wrong colours; Home Assistant inserts a stock full refresh when the panel's budget runs out."
+                    "experimental_refresh_modes": "EXPERIMENTAL, for desk testing. Offers the drive modes this display's configuration marks as experimental (faster or custom waveforms) in the service mode field, the default drive mode and the drive preset update. They are not validated on every panel and can leave ghosting or wrong colours; Home Assistant inserts a stock full refresh when the panel's budget runs out.",
+                    "default_drive_mode": "The drive mode uploads run in when a call names none. Empty = the stock full refresh. Lists this display's modes (experimental ones after enabling them and reopening this form)."
                 }
             }
         }
@@ -137,11 +139,6 @@
         "update": {
             "firmware": {
                 "name": "Firmware"
-            }
-        },
-        "select": {
-            "refresh_mode": {
-                "name": "Refresh mode"
             }
         }
     },
@@ -271,6 +268,25 @@
                 "off": "Force off",
                 "on": "Force on"
             }
+        },
+        "drive_mode": {
+            "options": {
+                "full": "full – stock full refresh",
+                "fast": "fast – stock fast refresh (where the panel has one)",
+                "partial": "partial – changed area only (B/W panels with partial support)",
+                "colour16": "colour16 – 16 colours in 3 passes (BWRY)",
+                "pll07": "pll07 – stock look, quicker clock (2.9in BWRY, experimental)",
+                "bwpartial": "bwpartial – only changed black/white pixels, no flash (2.9in BWRY, experimental)",
+                "pll08": "pll08 – stock look, quicker clock (7.3in, experimental)",
+                "fast6": "fast6 – faster colour refresh, cool band (7.3in, experimental)",
+                "fast7": "fast7 – faster colour refresh, warm band (7.3in, experimental)",
+                "partial6": "partial6 – flashing partial, cool band (7.3in, experimental)",
+                "hosttable": "hosttable – table built per image (7.3in, experimental)",
+                "pll04": "pll04 – stock look, quicker clock (7.09in, experimental)",
+                "hold47": "hold47 – stock waveform, unchanged pixels held (7.09in, experimental)",
+                "fastg13": "fastg13 – faster colour refresh, cool band (7.09in, experimental)",
+                "partialmix": "partialmix – flashing partial, K/W/Y/B only (7.09in, experimental)"
+            }
         }
     },
     "services": {
@@ -298,8 +314,8 @@
                     "name": "Refresh mode"
                 },
                 "mode": {
-                    "name": "Drive mode",
-                    "description": "A drive mode the display's configuration declares, by name (for example fast6 or colour16). Overrides the display's Refresh mode select for this call. Experimental modes need the option \"Enable experimental refresh modes\". Mode 0 (full) and fast keep the refresh mode above; any other mode ignores it, and also ignores tone compression and refined dithering."
+                    "name": "Mode",
+                    "description": "How the display refreshes: full, fast, partial or one of the display's drive modes by name (the Last refresh mode sensor lists them under available_modes). Left empty, the display's \"Default drive mode\" option applies. Experimental modes need the option \"Enable experimental refresh modes\". Drive modes other than full and fast ignore the refresh mode, tone compression and refined dithering."
                 },
                 "rotation": {
                     "description": "The rotation angle in degrees, applied clockwise.",
@@ -501,8 +517,8 @@
                     "name": "Refresh type"
                 },
                 "mode": {
-                    "name": "Drive mode",
-                    "description": "A drive mode the display's configuration declares, by name (for example fast6 or colour16). Overrides the display's Refresh mode select for this call. Experimental modes need the option \"Enable experimental refresh modes\". Mode 0 (full) and fast keep the refresh mode above; any other mode ignores it, and also ignores tone compression and refined dithering."
+                    "name": "Mode",
+                    "description": "How the display refreshes: full, fast, partial or one of the display's drive modes by name (the Last refresh mode sensor lists them under available_modes). Left empty, the display's \"Default drive mode\" option applies. Experimental modes need the option \"Enable experimental refresh modes\". Drive modes other than full and fast ignore the refresh mode, tone compression and refined dithering."
                 },
                 "measured_palette": {
                     "description": "Use the panel's measured color palette when available. Turn off to dither against the theoretical color scheme. No effect on panels without measured data.",

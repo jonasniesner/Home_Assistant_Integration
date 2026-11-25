@@ -48,6 +48,7 @@ from opendisplay import (
 
 from .ble_lock import ble_connection
 from .const import (
+    CONF_DEFAULT_DRIVE_MODE,
     CONF_ENCRYPTION_KEY,
     CONF_EXPERIMENTAL_MODES,
     CONF_GITHUB_TOKEN,
@@ -72,6 +73,7 @@ from .const import (
     SLEEP_MODE_ON,
     TCP_CONNECT_TIMEOUT_S,
 )
+from .refresh_modes import experimental_enabled, selectable_modes
 from .transport import note_mdns_seen
 
 _LOGGER = logging.getLogger(__name__)
@@ -111,8 +113,25 @@ def _txt_bool(properties: Mapping[str, Any], key: str) -> bool:
     return value is not None and value.lower() in ("1", "true", "yes")
 
 
-def _options_schema() -> vol.Schema:
-    """Return the options-flow schema."""
+def _options_schema(drive_modes: list[str] | None = None) -> vol.Schema:
+    """Return the options-flow schema.
+
+    ``drive_modes`` are this display's selectable drive modes; with two or more,
+    the form offers the default one (left empty, uploads run in the stock mode).
+    """
+    default_mode: dict[Any, Any] = (
+        {
+            vol.Optional(CONF_DEFAULT_DRIVE_MODE): SelectSelector(
+                SelectSelectorConfig(
+                    options=drive_modes,
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="drive_mode",
+                )
+            )
+        }
+        if drive_modes is not None and len(drive_modes) > 1
+        else {}
+    )
     return vol.Schema(
         {
             vol.Required(CONF_SLEEP_MODE, default=DEFAULT_SLEEP_MODE): SelectSelector(
@@ -150,6 +169,7 @@ def _options_schema() -> vol.Schema:
             vol.Required(
                 CONF_EXPERIMENTAL_MODES, default=DEFAULT_EXPERIMENTAL_MODES
             ): BooleanSelector(),
+            **default_mode,
             vol.Optional(CONF_GITHUB_TOKEN): TextSelector(
                 TextSelectorConfig(type=TextSelectorType.PASSWORD)
             ),
@@ -538,6 +558,19 @@ class OpenDisplayOptionsFlow(OptionsFlowWithReload):
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(), self.config_entry.options
+                _options_schema(self._drive_modes()), self.config_entry.options
             ),
         )
+
+    def _drive_modes(self) -> list[str] | None:
+        """Return the loaded display's drive modes (experimental ones only with the opt-in)."""
+        runtime = getattr(self.config_entry, "runtime_data", None)
+        config = getattr(runtime, "device_config", None)
+        if config is None:
+            return None
+        return [
+            mode.name
+            for mode in selectable_modes(
+                config, experimental_enabled(self.config_entry)
+            )
+        ]

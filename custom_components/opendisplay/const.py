@@ -92,10 +92,12 @@ EVENT_CONTENT_EXPIRED = f"{DOMAIN}_content_expired"
 
 # --- Refresh (drive) modes ----------------------------------------------------
 # Option: offer the drive modes the device config flags EXPERIMENTAL (0xAE mode
-# tail bit 0) in the refresh-mode select, the service `mode` field and the
+# tail bit 0) in the service `mode` field, the default-mode option and the
 # preset-update repair.
 CONF_EXPERIMENTAL_MODES = "experimental_refresh_modes"
 DEFAULT_EXPERIMENTAL_MODES = False
+# Option: the drive mode uploads run in when a call names none (unset = stock).
+CONF_DEFAULT_DRIVE_MODE = "default_drive_mode"
 
 # Carries the DriveRun of the latest upload (see refresh_modes.py); consumed by
 # the refresh-mode select and the "last refresh mode" sensor.

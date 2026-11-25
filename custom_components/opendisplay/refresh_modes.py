@@ -10,16 +10,16 @@ keeps no history, so the host decides per upload, with py-opendisplay's planner:
   band changed, drive data changed, state lost),
 * and which inline tables the chosen mode needs (``INLINE_LUT``).
 
-The per-device drive state and the selected mode live in a Home Assistant
+The per-device drive state, the prior frame and the last run live in a Home Assistant
 ``Store``; the drive state is keyed and fingerprinted exactly as the library's
 ``DriveStateStore`` protocol expects, so the planner reads it unchanged.
 """
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-import base64
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -39,6 +39,7 @@ from opendisplay import (
     RefreshMode,
     Rotation,
 )
+from opendisplay.exceptions import DriveEtagMismatchError
 from opendisplay.models.config import GlobalConfig
 from opendisplay.models.drive_ext import LutFamily
 from opendisplay.models.ident import FirmwareTarget
@@ -47,7 +48,6 @@ from opendisplay.models.lut_lint import mode_problem
 from opendisplay.models.panel_drive import LUT_SLOT_NONE, DisplayMode
 from opendisplay.panels.drive_plan import DrivePlan, plan_drive, record_drive
 from opendisplay.panels.drive_state import DriveState, drive_fingerprint
-from opendisplay.exceptions import DriveEtagMismatchError
 from opendisplay.panels.prior import PriorConflictError
 
 from .const import (
@@ -280,7 +280,7 @@ class RefreshModeStore:
     # -- prior frame (what the panel shows now) -----------------------------
 
     def get_prior(self, name: str, fingerprint: str) -> bytes | None:
-        """The frame the panel shows now, when it was recorded against these drive packets."""
+        """Return the frame the panel shows now, when recorded against these drive packets."""
         raw = self._data["priors"].get(name)
         if not isinstance(raw, dict) or raw.get("fingerprint") != fingerprint:
             return None
@@ -290,7 +290,7 @@ class RefreshModeStore:
             return None
 
     def get_prior_etag(self, name: str, fingerprint: str) -> int | None:
-        """The etag the device gave the prior frame (protocol 2.5), or None."""
+        """Return the etag the device gave the prior frame (protocol 2.5), or None."""
         raw = self._data["priors"].get(name)
         if not isinstance(raw, dict) or raw.get("fingerprint") != fingerprint:
             return None
@@ -312,21 +312,20 @@ class RefreshModeStore:
         self._schedule_save()
 
     def forget_prior(self, name: str) -> None:
-        """The panel's content is unknown (a plain upload, or a failed drive)."""
+        """Forget the prior: the panel's content is unknown (a plain upload, or a failed drive)."""
         if self._data["priors"].pop(name, None) is not None:
             self._schedule_save()
 
-    # -- selection and last run --------------------------------------------
+    # -- legacy selection and last run ---------------------------------------
 
-    @property
-    def selected(self) -> str | None:
-        """The selected mode name, or None for the stock mode."""
-        return self._data["selected"]
-
-    def set_selected(self, name: str | None) -> None:
-        """Persist the selected mode name."""
-        self._data["selected"] = name
+    def pop_selected(self) -> str | None:
+        """Return (once, then clear) the mode the removed Refresh mode select had stored."""
+        name = self._data.get("selected")
+        if name is None:
+            return None
+        self._data["selected"] = None
         self._schedule_save()
+        return name
 
     @property
     def last_run(self) -> DriveRun | None:
@@ -636,7 +635,10 @@ async def async_drive_upload(
     prior = store.get_prior(key, fingerprint)
     prior_etag = store.get_prior_etag(key, fingerprint)
     if prior is not None and _rebooted_since_last_connect(entry, device):
-        _LOGGER.info("%s: the device rebooted since the last upload; prior frame dropped", entry.unique_id)
+        _LOGGER.info(
+            "%s: the device rebooted since the last upload; prior frame dropped",
+            entry.unique_id,
+        )
         store.forget_prior(key)
         prior = None
         prior_etag = None
@@ -646,9 +648,7 @@ async def async_drive_upload(
         step_mode = _mode_by_index(config, step.mode_index)
         name = step.name
         use_prior = (
-            prior
-            if step_mode.ext is not None and step_mode.ext.hold_codes
-            else None
+            prior if step_mode.ext is not None and step_mode.ext.hold_codes else None
         )
         if step_mode.ext is not None and step_mode.ext.hold_codes and prior is None:
             # Unknown panel content: a hold-code mode would drive every pixel; draw stock.
@@ -676,7 +676,9 @@ async def async_drive_upload(
         frame = getattr(device.display, "last_frame", None)
         prior = bytes(frame) if isinstance(frame, (bytes, bytearray)) else None
         etag = getattr(device.display, "last_etag", None)
-        prior_etag = etag if isinstance(etag, int) and not isinstance(etag, bool) else None
+        prior_etag = (
+            etag if isinstance(etag, int) and not isinstance(etag, bool) else None
+        )
         changed = getattr(device.display, "last_changed", None)
         driven = changed if isinstance(changed, int) else None
         store.put_prior(key, fingerprint, prior, prior_etag)
@@ -765,7 +767,7 @@ def record_plain_upload(
 
 
 def drive_options(mode: DisplayMode) -> Mapping[str, Any]:
-    """Descriptive attributes of a mode for the select entity."""
+    """Descriptive attributes of a mode (the Last refresh mode sensor lists them)."""
     ext = mode.ext
     return {
         "mode_index": mode.mode_index,

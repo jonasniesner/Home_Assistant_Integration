@@ -54,7 +54,26 @@ upload_image:
         mode:
           required: false
           selector:
-            text:
+            select:
+              custom_value: true
+              mode: dropdown
+              translation_key: drive_mode
+              options:
+                - "full"
+                - "fast"
+                - "partial"
+                - "colour16"
+                - "pll07"
+                - "bwpartial"
+                - "pll08"
+                - "fast6"
+                - "fast7"
+                - "partial6"
+                - "hosttable"
+                - "pll04"
+                - "hold47"
+                - "fastg13"
+                - "partialmix"
         fit_mode:
           required: false
           default: "contain"
@@ -429,11 +448,33 @@ drawcustom:
             - "fast"
             - "partial"
     mode:
-      name: Drive mode
-      description: Drive mode by name, overriding the display's refresh-mode select.
+      name: Mode
+      description: >
+        How the display refreshes: full, fast, partial or one of the display's drive
+        modes (the Last refresh mode sensor lists them under available_modes). Left
+        empty, the display's default drive mode option applies.
       required: false
       selector:
-        text:
+        select:
+          custom_value: true
+          mode: dropdown
+          translation_key: drive_mode
+          options:
+            - "full"
+            - "fast"
+            - "partial"
+            - "colour16"
+            - "pll07"
+            - "bwpartial"
+            - "pll08"
+            - "fast6"
+            - "fast7"
+            - "partial6"
+            - "hosttable"
+            - "pll04"
+            - "hold47"
+            - "fastg13"
+            - "partialmix"
     tone_compression:
       name: Tone compression
       description: Tone compression strength (0–100%). Omit for no compression.

@@ -33,7 +33,14 @@ from . import OpenDisplayConfigEntry
 from .const import SIGNAL_DRIVE_RUN
 from .coordinator import OpenDisplayUpdate
 from .entity import OpenDisplayEntity
-from .refresh_modes import DriveRun, RefreshModeStore, display_modes
+from .refresh_modes import (
+    DriveRun,
+    RefreshModeStore,
+    display_modes,
+    drive_options,
+    experimental_enabled,
+    selectable_modes,
+)
 
 PARALLEL_UPDATES = 0
 
@@ -237,6 +244,7 @@ class OpenDisplayLastRefreshModeSensor(SensorEntity):
         self._address = address
         self._store = store
         self._attr_unique_id = f"{address}-last_refresh_mode"
+        self._entry = entry
         self._attr_device_info = DeviceInfo(
             connections={(CONNECTION_BLUETOOTH, address)}
         )
@@ -249,9 +257,15 @@ class OpenDisplayLastRefreshModeSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, object] | None:
-        """Every drive of the last upload, the temperature and the budget."""
+        """Every drive of the last upload, and the modes a call can name."""
         run = self._store.last_run
-        return run.as_attributes() if run is not None else None
+        attributes: dict[str, object] = run.as_attributes() if run is not None else {}
+        config = self._entry.runtime_data.device_config
+        attributes["available_modes"] = {
+            mode.name: dict(drive_options(mode))
+            for mode in selectable_modes(config, experimental_enabled(self._entry))
+        }
+        return attributes
 
     async def async_added_to_hass(self) -> None:
         """Update after each upload."""

@@ -74,13 +74,19 @@ if TYPE_CHECKING:
     from . import OpenDisplayConfigEntry
 
 from .ble_lock import ble_connection
-from .const import CONF_ENCRYPTION_KEY, DOMAIN, SIGNAL_IMAGE_UPDATED
+from .const import (
+    CONF_DEFAULT_DRIVE_MODE,
+    CONF_ENCRYPTION_KEY,
+    DOMAIN,
+    SIGNAL_IMAGE_UPDATED,
+)
 from .delivery import DELIVERY_DEADLINE_S, DeliveryReceipt
 from .refresh_modes import (
     REFRESH_MODE_BY_NAME,
     DriveRequest,
     RefreshModeError,
     async_drive_upload,
+    display_modes,
     experimental_enabled,
     frame_codes,
     record_plain_upload,
@@ -668,7 +674,16 @@ async def _async_send_image(
     # transfer runs on the loop. This mirrors what device.upload_image() does
     # internally, but that call ran _prepare_image synchronously on the loop.
     config = entry.runtime_data.device_config
-    drive_mode = _effective_drive_mode(entry, config, mode)
+    plain = _plain_refresh(config, mode)
+    if plain is not None:
+        # "full", "fast" or "partial" that the display does not declare as a drive
+        # mode: the plain upload with that refresh mode.
+        refresh_mode, mode = plain, None
+    drive_mode = (
+        stock_mode(config)
+        if plain is not None
+        else _effective_drive_mode(entry, config, mode)
+    )
     if drive_mode is not None and not uses_drive_write(drive_mode):
         refresh_mode = REFRESH_MODE_BY_NAME.get(drive_mode.name.lower(), refresh_mode)
         drive_mode = None
@@ -814,15 +829,36 @@ async def _async_send_image(
     return DeliveryReceipt(status="delivered", expires_at=None)
 
 
+# Mode names every display answers to, through the plain upload's refresh mode,
+# unless its config declares a drive mode of that name.
+PLAIN_REFRESH_BY_NAME: dict[str, RefreshMode] = {
+    "full": RefreshMode.FULL,
+    "fast": RefreshMode.FAST,
+    "partial": RefreshMode.PARTIAL,
+}
+
+
+def _plain_refresh(config: GlobalConfig | None, mode: str | None) -> RefreshMode | None:
+    """Return the refresh mode a ``mode`` of full/fast/partial means, unless a drive mode has that name."""
+    if mode is None:
+        return None
+    key = mode.lower()
+    if key not in PLAIN_REFRESH_BY_NAME:
+        return None
+    if any(m.name.lower() == key for m in display_modes(config)):
+        return None
+    return PLAIN_REFRESH_BY_NAME[key]
+
+
 def _effective_drive_mode(
     entry: OpenDisplayConfigEntry, config: GlobalConfig | None, requested: str | None
 ) -> DisplayMode | None:
-    """Return the drive mode an upload runs in: the call's ``mode``, else the selected one.
+    """Return the drive mode an upload runs in: the call's ``mode``, else the default option.
 
     None when the display declares no drive modes and no mode was asked for.
     """
-    store = entry.runtime_data.refresh_modes
-    name = requested or (store.selected if store is not None else None)
+    default = entry.options.get(CONF_DEFAULT_DRIVE_MODE) or None
+    name = requested or default
     if name is None:
         return stock_mode(config)
     try:
@@ -830,7 +866,7 @@ def _effective_drive_mode(
     except ServiceValidationError:
         if requested is not None:
             raise
-        # A stale selection (the drive data or the opt-in changed): stock mode.
+        # A stale default (the drive data or the opt-in changed): stock mode.
         return stock_mode(config)
 
 

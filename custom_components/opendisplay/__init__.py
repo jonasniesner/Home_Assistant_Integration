@@ -21,7 +21,11 @@ from homeassistant.exceptions import (
     ConfigEntryError,
     ConfigEntryNotReady,
 )
-from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.typing import ConfigType
 
@@ -40,7 +44,13 @@ from opendisplay import (
 from opendisplay.models.config_json import config_from_json, config_to_json
 
 from .ble_lock import async_get_ble_lock, ble_connection
-from .const import CONF_CACHED_STATE, CONF_ENCRYPTION_KEY, DOMAIN, SETUP_DEADLINE_S
+from .const import (
+    CONF_CACHED_STATE,
+    CONF_DEFAULT_DRIVE_MODE,
+    CONF_ENCRYPTION_KEY,
+    DOMAIN,
+    SETUP_DEADLINE_S,
+)
 from .coordinator import OpenDisplayCoordinator
 from .delivery import DeliveryManager
 from .keystore import EntryKeyStore
@@ -64,14 +74,12 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 BASE_PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.IMAGE,
-    Platform.SELECT,
     Platform.SENSOR,
 ]
 FLEX_PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.EVENT,
     Platform.IMAGE,
-    Platform.SELECT,
     Platform.SENSOR,
     Platform.UPDATE,
 ]
@@ -222,6 +230,29 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the OpenDisplay integration."""
     async_setup_services(hass)
     return True
+
+
+def _migrate_refresh_mode_select(
+    hass: HomeAssistant, entry: OpenDisplayConfigEntry, store: RefreshModeStore
+) -> None:
+    """Move the removed Refresh mode select into the default-drive-mode option.
+
+    The mode it had stored becomes the option (unless one is set), and its
+    orphaned entity is removed from the registry.
+    """
+    selected = store.pop_selected()
+    if selected and not entry.options.get(CONF_DEFAULT_DRIVE_MODE):
+        hass.config_entries.async_update_entry(
+            entry, options={**entry.options, CONF_DEFAULT_DRIVE_MODE: selected}
+        )
+    if entry.unique_id is None:
+        return
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(
+        "select", DOMAIN, f"{entry.unique_id}-refresh_mode"
+    )
+    if entity_id is not None:
+        registry.async_remove(entity_id)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) -> bool:
@@ -388,6 +419,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
     refresh_modes = RefreshModeStore(hass, entry.entry_id)
     await refresh_modes.async_load()
     entry.runtime_data.refresh_modes = refresh_modes
+    _migrate_refresh_mode_select(hass, entry, refresh_modes)
 
     if device_profile is not None:
         await async_update_preset_update_issue(
@@ -421,7 +453,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
         else:
             # A reboot may redraw the panel (boot screen): the stored prior frame is stale.
             if entry.runtime_data.refresh_modes is not None:
-                entry.runtime_data.refresh_modes.forget_prior(entry.unique_id or entry.entry_id)
+                entry.runtime_data.refresh_modes.forget_prior(
+                    entry.unique_id or entry.entry_id
+                )
             hass.async_create_task(_async_reload_after_reboot(hass, entry))
 
     entry.async_on_unload(coordinator.async_subscribe_reboot(_schedule_reboot_reload))

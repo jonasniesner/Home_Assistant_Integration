@@ -1,4 +1,4 @@
-"""Test refresh (drive) modes: the select, the host-side plan, inline tables and the preset repair."""
+"""Test refresh (drive) modes: the mode field and default option, the plan, inline tables and the preset repair."""
 
 from collections import Counter
 from collections.abc import Generator
@@ -32,7 +32,11 @@ from pytest_homeassistant.components.repairs import (
 )
 from pytest_homeassistant.typing import ClientSessionGenerator
 
-from custom_components.opendisplay.const import CONF_EXPERIMENTAL_MODES, DOMAIN
+from custom_components.opendisplay.const import (
+    CONF_DEFAULT_DRIVE_MODE,
+    CONF_EXPERIMENTAL_MODES,
+    DOMAIN,
+)
 from custom_components.opendisplay.refresh_modes import RefreshModeError, inline_tables
 from custom_components.opendisplay.repairs import preset_update_issue_id
 
@@ -139,14 +143,6 @@ def _device_id(hass: HomeAssistant) -> str:
     return devices[0].id
 
 
-def _select_entity(hass: HomeAssistant) -> str:
-    entity_id = er.async_get(hass).async_get_entity_id(
-        "select", DOMAIN, f"{TEST_ADDRESS}-refresh_mode"
-    )
-    assert entity_id is not None
-    return entity_id
-
-
 def _sensor_entity(hass: HomeAssistant) -> str:
     entity_id = er.async_get(hass).async_get_entity_id(
         "sensor", DOMAIN, f"{TEST_ADDRESS}-last_refresh_mode"
@@ -172,12 +168,11 @@ async def _upload(hass: HomeAssistant, **extra: Any) -> None:
     await hass.async_block_till_done()
 
 
-async def _select(hass: HomeAssistant, option: str) -> None:
-    await hass.services.async_call(
-        "select",
-        "select_option",
-        {"entity_id": _select_entity(hass), "option": option},
-        blocking=True,
+async def _set_default(hass: HomeAssistant, option: str) -> None:
+    """Set the default-drive-mode option (as the options flow would, without its reload)."""
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    hass.config_entries.async_update_entry(
+        entry, options={**entry.options, CONF_DEFAULT_DRIVE_MODE: option}
     )
 
 
@@ -194,13 +189,12 @@ def _shown_modes(show: AsyncMock) -> list[str]:
 async def test_experimental_modes_are_offered_only_with_the_opt_in(
     hass: HomeAssistant, mock_config_entry: MockConfigEntry, names: list[str]
 ) -> None:
-    """The select lists the stock modes, and the experimental ones after the opt-in."""
+    """The sensor lists the stock modes, and the experimental ones after the opt-in."""
     await _setup(hass, mock_config_entry)
 
-    state = hass.states.get(_select_entity(hass))
+    state = hass.states.get(_sensor_entity(hass))
     assert state is not None
-    assert state.attributes["options"] == names
-    assert state.state == "full"
+    assert list(state.attributes["available_modes"]) == names
 
 
 @pytest.mark.parametrize("experimental", [False])
@@ -230,18 +224,20 @@ async def test_an_unknown_mode_is_refused(
     show.assert_not_awaited()
 
 
-async def test_a_display_without_drive_modes_has_no_select(
+async def test_a_display_without_drive_modes_has_no_sensor(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_opendisplay_device: MagicMock,
 ) -> None:
-    """No 0xAE modes: no select, no sensor, and uploads stay on the plain path."""
+    """No 0xAE modes: no sensor, and uploads stay on the plain path."""
     mock_opendisplay_device.config = DEVICE_CONFIG
     await _setup(hass, mock_config_entry)
 
     registry = er.async_get(hass)
     assert (
-        registry.async_get_entity_id("select", DOMAIN, f"{TEST_ADDRESS}-refresh_mode")
+        registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{TEST_ADDRESS}-last_refresh_mode"
+        )
         is None
     )
     await _upload(hass)
@@ -276,9 +272,9 @@ async def test_the_fast_mode_uses_the_fast_refresh(
     mock_opendisplay_device: MagicMock,
     show: AsyncMock,
 ) -> None:
-    """Selecting "fast" sends the plain upload with the fast refresh."""
+    """A default mode "fast" sends the plain upload with the fast refresh."""
     await _setup(hass, mock_config_entry)
-    await _select(hass, "fast")
+    await _set_default(hass, "fast")
 
     await _upload(hass)
 
@@ -298,7 +294,7 @@ async def test_the_plan_inserts_a_stock_full_and_switches_band(
 ) -> None:
     """No state: a stock full comes first; at 27 C the band-7 variant runs instead."""
     await _setup(hass, mock_config_entry)
-    await _select(hass, "fast6")
+    await _set_default(hass, "fast6")
 
     # No drive state and no temperature yet: stock full, then the requested band.
     await _upload(hass)
@@ -323,16 +319,15 @@ async def test_the_plan_inserts_a_stock_full_and_switches_band(
     show.reset_mock()
     await _upload(hass)
     assert _shown_modes(show) == ["fast7"]
-    select = hass.states.get(_select_entity(hass))
-    assert select is not None
-    assert select.state == "fast6"
-    assert select.attributes["last_chosen"] == "fast7"
-    assert select.attributes["last_budget_used"] == 2
+    sensor = hass.states.get(_sensor_entity(hass))
+    assert sensor is not None
+    assert sensor.attributes["chosen"] == "fast7"
+    assert sensor.attributes["budget_used"] == 2
 
-    # The selection and the drive state survive a reload.
+    # The default and the drive state survive a reload.
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    assert mock_config_entry.options[CONF_DEFAULT_DRIVE_MODE] == "fast6"
     stored = hass_storage[f"{DOMAIN}.refresh_modes.{mock_config_entry.entry_id}"]
-    assert stored["data"]["selected"] == "fast6"
     record = stored["data"]["devices"][TEST_ADDRESS]
     assert record["budget_used"] == 2
     assert record["last_band"] == 7
@@ -340,9 +335,6 @@ async def test_the_plan_inserts_a_stock_full_and_switches_band(
 
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
-    select = hass.states.get(_select_entity(hass))
-    assert select is not None
-    assert select.state == "fast6"
     show.reset_mock()
     await _upload(hass)
     assert _shown_modes(show) == ["fast7"]
@@ -630,3 +622,50 @@ async def test_the_preset_fix_resolves_when_the_update_is_gone(
         )
         is None
     )
+
+
+# -- the removed select: migration; plain names ------------------------------------
+
+
+async def test_the_old_select_becomes_the_default_option(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A stored select choice moves into the option and the orphaned entity goes."""
+    hass_storage[f"{DOMAIN}.refresh_modes.{mock_config_entry.entry_id}"] = {
+        "version": 1,
+        "key": f"{DOMAIN}.refresh_modes.{mock_config_entry.entry_id}",
+        "data": {"selected": "fast", "devices": {}, "last_run": None, "priors": {}},
+    }
+    mock_config_entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        "select", DOMAIN, f"{TEST_ADDRESS}-refresh_mode", config_entry=mock_config_entry
+    )
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.options[CONF_DEFAULT_DRIVE_MODE] == "fast"
+    assert (
+        registry.async_get_entity_id("select", DOMAIN, f"{TEST_ADDRESS}-refresh_mode")
+        is None
+    )
+
+
+async def test_mode_partial_is_the_plain_partial_refresh(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opendisplay_device: MagicMock,
+    show: AsyncMock,
+) -> None:
+    """mode: partial (not a declared drive mode) is the plain upload's partial refresh."""
+    await _setup(hass, mock_config_entry)
+    await _set_default(hass, "fast6")
+
+    await _upload(hass, mode="partial")
+
+    show.assert_not_awaited()
+    call = mock_opendisplay_device.upload_prepared_image.await_args
+    assert call is not None
+    assert call.kwargs["refresh_mode"].name == "PARTIAL"
