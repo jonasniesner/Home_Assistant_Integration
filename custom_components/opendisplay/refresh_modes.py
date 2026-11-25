@@ -34,6 +34,7 @@ import numpy as np
 from opendisplay import (
     DitherMode,
     DriveModeSubstitutedError,
+    DriveModeTemperatureError,
     FitMode,
     InvalidResponseError,
     RefreshMode,
@@ -577,7 +578,8 @@ async def _show(
 ) -> int | None:
     """One drive upload; library errors become RefreshModeError.
 
-    PriorConflictError and DriveEtagMismatchError pass: the caller draws stock instead.
+    PriorConflictError, DriveEtagMismatchError and DriveModeSubstitutedError pass: the
+    caller draws stock instead.
     """
     try:
         return await device.display.show(
@@ -592,10 +594,11 @@ async def _show(
             prior=prior,
             prior_etag=prior_etag,
         )
-    except DriveModeSubstitutedError as err:
+    except DriveModeSubstitutedError:
+        raise
+    except DriveModeTemperatureError as err:
         raise RefreshModeError(
-            f"The display runs mode {err.actual} instead of '{name}'"
-            f"{f' at {err.temp_c} °C' if err.temp_c is not None else ''}; nothing was uploaded"
+            f"The display refuses '{name}' at its current temperature: {err}"
         ) from err
     except InvalidResponseError as err:
         if tables and _UNSUPPORTED_NACK in str(err):
@@ -659,6 +662,7 @@ async def async_drive_upload(
         prior = None
         prior_etag = None
     ran: list[str] = []
+    device_notes: list[str] = []
     driven: int | None = None
     for step in plan.steps:
         step_mode = _mode_by_index(config, step.mode_index)
@@ -689,6 +693,26 @@ async def async_drive_upload(
             _LOGGER.info("%s: %s; drawing stock '%s'", entry.unique_id, err, stock.name)
             name, step_mode = stock.name, stock
             temp_c = await _show(device, request, name, None, None)
+        except DriveModeSubstitutedError as err:
+            # The device's own window check (a stale host reading): it runs its stock full.
+            stock = stock_mode(config)
+            if stock is None or err.actual != stock.mode_index:
+                raise RefreshModeError(
+                    f"The display runs mode {err.actual} instead of '{name}'"
+                    f"{f' at {err.temp_c} °C' if err.temp_c is not None else ''}; nothing was uploaded"
+                ) from err
+            _LOGGER.info(
+                "%s: '%s' is outside its temperature window at %s C; drawing stock '%s'",
+                entry.unique_id,
+                name,
+                err.temp_c,
+                stock.name,
+            )
+            device_notes.append(
+                f"{err.temp_c} C is outside the window of '{name}': the display ran stock '{stock.name}'"
+            )
+            name, step_mode = stock.name, stock
+            temp_c = await _show(device, request, name, None, None)
         frame = getattr(device.display, "last_frame", None)
         prior = bytes(frame) if isinstance(frame, (bytes, bytearray)) else None
         etag = getattr(device.display, "last_etag", None)
@@ -711,10 +735,13 @@ async def async_drive_upload(
         temp_c=temp_c,
         budget_used=state.budget_used if state is not None else None,
         budget_limit=_budget_limit(config),
-        substituted=plan.chosen != plan.requested or chosen != plan.steps[-1].name,
+        substituted=plan.substituted
+        or plan.chosen != plan.requested
+        or chosen != plan.steps[-1].name,
         stock_full_first=plan.stock_full_first,
         near_edge=plan.near_edge,
         notes=plan.notes
+        + tuple(device_notes)
         + ((f"prior: drove {driven} changed pixels",) if driven is not None else ()),
         reasons=tuple(step.reason for step in plan.steps),
     )
@@ -782,6 +809,9 @@ def record_plain_upload(
     )
 
 
+_TEMP_POLICY_NAMES = {0: "advisory", 1: "stock_outside", 2: "refuse_outside"}
+
+
 def drive_options(mode: DisplayMode) -> Mapping[str, Any]:
     """Descriptive attributes of a mode (the Last refresh mode sensor lists them)."""
     ext = mode.ext
@@ -792,4 +822,7 @@ def drive_options(mode: DisplayMode) -> Mapping[str, Any]:
         "temp_window_c": None
         if (mode.temp_min_c, mode.temp_max_c) == (0, 0)
         else [mode.temp_min_c, mode.temp_max_c],
+        "temp_policy": _TEMP_POLICY_NAMES.get(mode.temp_policy, str(mode.temp_policy))
+        if (mode.temp_min_c, mode.temp_max_c) != (0, 0)
+        else None,
     }

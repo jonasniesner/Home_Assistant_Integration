@@ -398,16 +398,38 @@ async def test_the_budget_forces_a_stock_full(
     assert "budget" in sensor.attributes["reasons"][0]
 
 
-async def test_a_substituting_device_is_a_clear_error(
+async def test_a_device_substituting_stock_draws_stock(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     show: AsyncMock,
 ) -> None:
-    """The device running another mode surfaces as an error naming both modes."""
+    """The device's window check runs mode 0: the image is drawn again in stock, with a note."""
     from opendisplay import DriveModeSubstitutedError
 
     await _setup(hass, mock_config_entry)
-    show.side_effect = DriveModeSubstitutedError("full_quick", 0, 30)
+    await _upload(hass, mode="full")
+    show.reset_mock()
+    show.side_effect = [DriveModeSubstitutedError("full_quick", 0, 31), 31]
+
+    await _upload(hass, mode="full_quick")
+
+    assert _shown_modes(show) == ["full_quick", "full"]
+    sensor = hass.states.get(_sensor_entity(hass))
+    assert sensor is not None
+    assert sensor.attributes["substituted"] is True
+    assert any("outside the window" in n for n in sensor.attributes["notes"])
+
+
+async def test_a_device_substituting_another_mode_is_a_clear_error(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    show: AsyncMock,
+) -> None:
+    """A substitution to anything but the stock full surfaces as an error naming both modes."""
+    from opendisplay import DriveModeSubstitutedError
+
+    await _setup(hass, mock_config_entry)
+    show.side_effect = DriveModeSubstitutedError("full_quick", 3, 30)
 
     with pytest.raises(HomeAssistantError, match="instead of 'full_quick'"):
         await _upload(hass, mode="full_quick")
