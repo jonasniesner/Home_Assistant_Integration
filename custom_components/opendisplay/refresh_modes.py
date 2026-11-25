@@ -71,12 +71,14 @@ STOCK_MODE_INDEX = 0
 REFRESH_MODE_BY_NAME: dict[str, RefreshMode] = {"fast": RefreshMode.FAST}
 # Reached only through a PartialState (the refresh_type "partial"), never selected.
 HIDDEN_MODE_NAMES = frozenset({"partial"})
+# Upload-path test modes: callable by name, never listed.
+TEST_MODE_PREFIX = "test_"
 
 # Inline-only tables: mode name -> the mode whose stored 0xAF table is the source
 # the per-update table is assembled from (assemble_subset_s6: the slots of codes
-# the frame does not use become the hold slot). ``hosttable`` runs on the set-6
-# rails of the 7.3in Spectra 6 preset, the same rails as ``fast6``.
-INLINE_TABLE_SOURCES: dict[str, str] = {"hosttable": "fast6"}
+# the frame does not use become the hold slot). ``adaptive`` runs on the set-6
+# rails of the 7.3in Spectra 6 preset, the same rails as ``faster_cool``.
+INLINE_TABLE_SOURCES: dict[str, str] = {"adaptive": "faster_cool"}
 # Targets whose firmware NACKs INLINE_LUT (no LUT cache, OD_ERR_DRIVE_UNSUPPORTED).
 _NO_INLINE_TARGETS = frozenset({FirmwareTarget.EFR32BG22, FirmwareTarget.TELINK})
 # The 0x0085 NACK code for "unsupported on this target".
@@ -108,11 +110,12 @@ def display_modes(config: GlobalConfig | None) -> list[DisplayMode]:
 def selectable_modes(
     config: GlobalConfig | None, include_experimental: bool
 ) -> list[DisplayMode]:
-    """Return the modes offered for selection: experimental ones only with the opt-in."""
+    """Return the modes offered for selection: experimental ones only with the opt-in, no test modes."""
     return [
         mode
         for mode in display_modes(config)
-        if include_experimental or not mode.experimental
+        if (include_experimental or not mode.experimental)
+        and not mode.name.lower().startswith(TEST_MODE_PREFIX)
     ]
 
 

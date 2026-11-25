@@ -279,17 +279,14 @@
         "fast": "fast – stock fast refresh (where the panel has one)",
         "partial": "partial – changed area only (B/W panels with partial support)",
         "colour16": "colour16 – 16 colours in 3 passes (BWRY)",
-        "pll07": "pll07 – stock look, quicker clock (2.9in BWRY, experimental)",
-        "bwpartial": "bwpartial – only changed black/white pixels, no flash (2.9in BWRY, experimental)",
-        "pll08": "pll08 – stock look, quicker clock (7.3in, experimental)",
-        "fast6": "fast6 – faster colour refresh, cool band (7.3in, experimental)",
-        "fast7": "fast7 – faster colour refresh, warm band (7.3in, experimental)",
-        "partial6": "partial6 – flashing partial, cool band (7.3in, experimental)",
-        "hosttable": "hosttable – table built per image (7.3in, experimental)",
-        "pll04": "pll04 – stock look, quicker clock (7.09in, experimental)",
-        "hold47": "hold47 – stock waveform, unchanged pixels held (7.09in, experimental)",
-        "fastg13": "fastg13 – faster colour refresh, cool band (7.09in, experimental)",
-        "partialmix": "partialmix – flashing partial, K/W/Y/B only (7.09in, experimental)"
+        "full_quick": "full_quick – stock look with a quicker clock (2.9in 9.2 s, 7.3in 19.2 s, 7.09in 22.6 s); experimental",
+        "faster_cool": "faster_cool – faster colour refresh at cooler temperatures (7.3in 16.2 s at 24 C and below, 7.09in 17.5 s at 25 C and below); experimental",
+        "faster_warm": "faster_warm – faster colour refresh above 24.5 C (7.3in, 16.2 s); Home Assistant swaps it with faster_cool by temperature; experimental",
+        "partial_bw": "partial_bw – redraws only changed pixels, black and white only, the rest does not flash (2.9in BWRY); experimental",
+        "changedonly": "changedonly – stock waveform, unchanged pixels held (7.09in); experimental",
+        "partialcool": "partialcool – flashing partial update, 15.2 s, 24 C and below (7.3in); experimental",
+        "partial4ink": "partial4ink – flashing partial update, 11.5 s, black/white/yellow/blue only (7.09in); experimental",
+        "adaptive": "adaptive – a table built for each image that skips the colours it does not use (7.3in); experimental"
       }
     }
   },

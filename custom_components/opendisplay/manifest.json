@@ -24,7 +24,7 @@
     "opendisplay"
   ],
   "requirements": [
-    "py-opendisplay[silabs-ota] @ git+https://github.com/jonasniesner/py-opendisplay@4dcc41b",
+    "py-opendisplay[silabs-ota] @ git+https://github.com/jonasniesner/py-opendisplay@a3d1a3e",
     "silabs-ble-ota==0.1.0",
     "odl-renderer==0.5.14"
   ],

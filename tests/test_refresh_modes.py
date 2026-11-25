@@ -51,13 +51,11 @@ STOCK_NAMES = ["full", "fast"]
 ALL_NAMES = [
     "full",
     "fast",
-    "pll08",
-    "replica6",
-    "replica7",
-    "fast6",
-    "fast7",
-    "partial6",
-    "hosttable",
+    "full_quick",
+    "faster_cool",
+    "faster_warm",
+    "partialcool",
+    "adaptive",
 ]
 
 
@@ -205,7 +203,7 @@ async def test_an_experimental_mode_is_refused_without_the_opt_in(
     await _setup(hass, mock_config_entry)
 
     with pytest.raises(ServiceValidationError) as err:
-        await _upload(hass, mode="fast6")
+        await _upload(hass, mode="faster_cool")
 
     assert err.value.translation_key == "refresh_mode_experimental"
     show.assert_not_awaited()
@@ -294,21 +292,21 @@ async def test_the_plan_inserts_a_stock_full_and_switches_band(
 ) -> None:
     """No state: a stock full comes first; at 27 C the band-7 variant runs instead."""
     await _setup(hass, mock_config_entry)
-    await _set_default(hass, "fast6")
+    await _set_default(hass, "faster_cool")
 
     # No drive state and no temperature yet: stock full, then the requested band.
     await _upload(hass)
-    assert _shown_modes(show) == ["full", "fast6"]
+    assert _shown_modes(show) == ["full", "faster_cool"]
 
-    # The ACK said 27 C, which is in fast7's window: band change, so a stock full first.
+    # The ACK said 27 C, which is in faster_warm's window: band change, so a stock full first.
     show.reset_mock()
     await _upload(hass)
-    assert _shown_modes(show) == ["full", "fast7"]
+    assert _shown_modes(show) == ["full", "faster_warm"]
 
     sensor = hass.states.get(_sensor_entity(hass))
     assert sensor is not None
-    assert sensor.state == "fast7"
-    assert sensor.attributes["requested"] == "fast6"
+    assert sensor.state == "faster_warm"
+    assert sensor.attributes["requested"] == "faster_cool"
     assert sensor.attributes["substituted"] is True
     assert sensor.attributes["stock_full_first"] is True
     assert sensor.attributes["temp_c"] == 27
@@ -318,26 +316,26 @@ async def test_the_plan_inserts_a_stock_full_and_switches_band(
     # Same band again: no stock full, the budget grows.
     show.reset_mock()
     await _upload(hass)
-    assert _shown_modes(show) == ["fast7"]
+    assert _shown_modes(show) == ["faster_warm"]
     sensor = hass.states.get(_sensor_entity(hass))
     assert sensor is not None
-    assert sensor.attributes["chosen"] == "fast7"
+    assert sensor.attributes["chosen"] == "faster_warm"
     assert sensor.attributes["budget_used"] == 2
 
     # The default and the drive state survive a reload.
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
-    assert mock_config_entry.options[CONF_DEFAULT_DRIVE_MODE] == "fast6"
+    assert mock_config_entry.options[CONF_DEFAULT_DRIVE_MODE] == "faster_cool"
     stored = hass_storage[f"{DOMAIN}.refresh_modes.{mock_config_entry.entry_id}"]
     record = stored["data"]["devices"][TEST_ADDRESS]
     assert record["budget_used"] == 2
-    assert record["last_band"] == 7
+    assert record["last_band"] == 2  # warm
     assert record["last_temp_c"] == 27
 
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
     show.reset_mock()
     await _upload(hass)
-    assert _shown_modes(show) == ["fast7"]
+    assert _shown_modes(show) == ["faster_warm"]
 
 
 async def test_the_budget_forces_a_stock_full(
@@ -348,13 +346,13 @@ async def test_the_budget_forces_a_stock_full(
     """Once the 0xB1 budget (10) would run over, a stock full is inserted."""
     await _setup(hass, mock_config_entry)
     for _ in range(10):
-        await _upload(hass, mode="fast7")
+        await _upload(hass, mode="faster_warm")
     show.reset_mock()
 
     # 10 budget units spent since the last stock full: the next one resets.
-    await _upload(hass, mode="fast7")
+    await _upload(hass, mode="faster_warm")
 
-    assert _shown_modes(show) == ["full", "fast7"]
+    assert _shown_modes(show) == ["full", "faster_warm"]
     sensor = hass.states.get(_sensor_entity(hass))
     assert sensor is not None
     assert "budget" in sensor.attributes["reasons"][0]
@@ -369,10 +367,10 @@ async def test_a_substituting_device_is_a_clear_error(
     from opendisplay import DriveModeSubstitutedError
 
     await _setup(hass, mock_config_entry)
-    show.side_effect = DriveModeSubstitutedError("pll08", 0, 30)
+    show.side_effect = DriveModeSubstitutedError("full_quick", 0, 30)
 
-    with pytest.raises(HomeAssistantError, match="instead of 'pll08'"):
-        await _upload(hass, mode="pll08")
+    with pytest.raises(HomeAssistantError, match="instead of 'full_quick'"):
+        await _upload(hass, mode="full_quick")
 
 
 # -- inline tables ---------------------------------------------------------------
@@ -383,12 +381,12 @@ async def test_hosttable_sends_its_table_inline(
     mock_config_entry: MockConfigEntry,
     show: AsyncMock,
 ) -> None:
-    """Every hosttable upload carries slot 5, built from fast6's table for the frame's codes."""
+    """Every adaptive upload carries slot 5, built from faster_cool's table for the frame's codes."""
     await _setup(hass, mock_config_entry)
 
-    await _upload(hass, mode="hosttable")
+    await _upload(hass, mode="adaptive")
 
-    assert _shown_modes(show) == ["full", "hosttable"]
+    assert _shown_modes(show) == ["full", "adaptive"]
     stock, host = show.await_args_list
     assert stock.kwargs["inline_luts"] is None
     tables = host.kwargs["inline_luts"]
@@ -405,20 +403,20 @@ async def test_hosttable_sends_its_table_inline(
 
     # And again on the next upload (the table is never stored).
     show.reset_mock()
-    await _upload(hass, mode="hosttable")
-    assert _shown_modes(show) == ["hosttable"]
+    await _upload(hass, mode="adaptive")
+    assert _shown_modes(show) == ["adaptive"]
     assert list(show.await_args.kwargs["inline_luts"]) == [5]
 
 
 def test_inline_tables_are_built_only_for_modes_that_need_them() -> None:
-    """Stored slots need nothing inline; hosttable needs codes and fast6's table."""
+    """Stored slots need nothing inline; adaptive needs codes and faster_cool's table."""
     modes = {m.name: m for m in S73.display_modes}
-    assert inline_tables(S73, modes["fast6"], None) is None
+    assert inline_tables(S73, modes["faster_cool"], None) is None
     with pytest.raises(RefreshModeError, match="codes are unknown"):
-        inline_tables(S73, modes["hosttable"], None)
-    no_source = _s73_config(drop=("fast6",))
-    host = next(m for m in no_source.display_modes if m.name == "hosttable")
-    with pytest.raises(RefreshModeError, match="'fast6'"):
+        inline_tables(S73, modes["adaptive"], None)
+    no_source = _s73_config(drop=("faster_cool",))
+    host = next(m for m in no_source.display_modes if m.name == "adaptive")
+    with pytest.raises(RefreshModeError, match="'faster_cool'"):
         inline_tables(no_source, host, frozenset({0, 1}))
 
 
@@ -433,7 +431,7 @@ async def test_inline_tables_are_refused_on_bg22(
     mock_opendisplay_connect.return_value.profile.target = FirmwareTarget.EFR32BG22
 
     with pytest.raises(HomeAssistantError, match="INLINE_LUT"):
-        await _upload(hass, mode="hosttable")
+        await _upload(hass, mode="adaptive")
 
     show.assert_not_awaited()
 
@@ -445,14 +443,14 @@ async def test_an_inline_nack_is_a_clear_error(
 ) -> None:
     """A device that NACKs the inline START (0x05) surfaces as an INLINE_LUT error."""
     await _setup(hass, mock_config_entry)
-    await _upload(hass, mode="fast6")  # consume the stock full
+    await _upload(hass, mode="faster_cool")  # consume the stock full
     show.reset_mock()
     show.side_effect = InvalidResponseError(
         "Drive write START for mode 8 refused: 0x05 (unsupported on this target)"
     )
 
     with pytest.raises(HomeAssistantError, match="does not accept INLINE_LUT"):
-        await _upload(hass, mode="hosttable")
+        await _upload(hass, mode="adaptive")
 
 
 # -- preset-update repair --------------------------------------------------------
@@ -461,7 +459,7 @@ async def test_an_inline_nack_is_a_clear_error(
 _FAST6 = next(
     p
     for p in S73.length_prefixed_packets
-    if p.packet_type == 0xAE and p.body[2:].startswith(b"fast6\x00")
+    if p.packet_type == 0xAE and p.body[2:].startswith(b"faster_cool\x00")
 )
 
 
@@ -476,7 +474,7 @@ def _preset_plan(**drive_changes: Any) -> PresetUpdatePlan:
         remove=tuple(p for p in S73.length_prefixed_packets if p.packet_type == 0xAE),
     )
     drive = dataclasses.replace(drive, **drive_changes)
-    update = PresetUpdate(PresetKind.DRIVE, 0x0023, 1, 2, "faster fast6", True)
+    update = PresetUpdate(PresetKind.DRIVE, 0x0023, 1, 2, "faster faster_cool", True)
     return PresetUpdatePlan(updates=(update,), drive=drive)
 
 
@@ -550,7 +548,7 @@ async def test_the_preset_fix_writes_the_drive_update_and_reloads(
         client = await hass_client()
         flow = await start_repair_fix_flow(client, DOMAIN, issue_id)
         assert flow["step_id"] == "confirm"
-        assert flow["description_placeholders"]["changelog"] == "faster fast6"
+        assert flow["description_placeholders"]["changelog"] == "faster faster_cool"
         assert flow["description_placeholders"]["panel"] == "0x0023"
 
         flow = await process_repair_fix_flow(client, flow["flow_id"])
@@ -661,7 +659,7 @@ async def test_mode_partial_is_the_plain_partial_refresh(
 ) -> None:
     """mode: partial (not a declared drive mode) is the plain upload's partial refresh."""
     await _setup(hass, mock_config_entry)
-    await _set_default(hass, "fast6")
+    await _set_default(hass, "faster_cool")
 
     await _upload(hass, mode="partial")
 
@@ -669,3 +667,19 @@ async def test_mode_partial_is_the_plain_partial_refresh(
     call = mock_opendisplay_device.upload_prepared_image.await_args
     assert call is not None
     assert call.kwargs["refresh_mode"].name == "PARTIAL"
+
+
+@pytest.mark.parametrize("experimental", [True])
+async def test_test_modes_are_callable_but_not_listed(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, show: AsyncMock
+) -> None:
+    """test_* modes stay out of available_modes, and a call can still name one."""
+    await _setup(hass, mock_config_entry)
+
+    state = hass.states.get(_sensor_entity(hass))
+    assert state is not None
+    assert not any(
+        name.startswith("test_") for name in state.attributes["available_modes"]
+    )
+    await _upload(hass, mode="test_cool")
+    assert _shown_modes(show)[-1] == "test_cool"
