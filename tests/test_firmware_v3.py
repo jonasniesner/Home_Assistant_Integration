@@ -605,3 +605,31 @@ async def test_the_repair_keeps_pointing_at_the_backup_after_a_setup(
 
     async_update_needs_migration_issue(hass, mock_config_entry, False)
     assert issue_registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_a_flash_stranded_in_the_apploader_can_be_retried(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opendisplay_device: MagicMock,
+    flash: AsyncMock,
+    migrate: AsyncMock,
+) -> None:
+    """The retry skips the pre-flight (the app is gone) and flashes the AppLoader."""
+    await _setup(hass, mock_config_entry)
+    result = await _start(hass, mock_config_entry)
+    backup = result["description_placeholders"]["backup"]
+    stranded = OTAFlashError("Firmware update failed: cut", reached_apploader=True)
+    with patch(f"{_V3}.async_flash_silabs", AsyncMock(side_effect=stranded)):
+        result = await _confirm(hass, result)
+    assert result["reason"] == "flash_failed_apploader"
+    # In the AppLoader, the app-mode connection of a new pre-flight would fail.
+    mock_opendisplay_device.__aenter__.side_effect = BLEConnectionError("no app")
+
+    result = await _start(hass, mock_config_entry)
+
+    assert result["step_id"] == "firmware_v3_confirm"
+    assert result["description_placeholders"]["backup"] == backup
+    mock_opendisplay_device.__aenter__.side_effect = None
+    result = await _confirm(hass, result)
+    assert result["reason"] == "firmware_v3_done"
+    flash.assert_awaited_once()

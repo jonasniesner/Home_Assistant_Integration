@@ -615,9 +615,15 @@ class OpenDisplayOptionsFlow(OptionsFlowWithReload):
             UpgradeRefusedError,
             async_find_release,
             async_preflight,
+            stranded_preflight,
         )
 
         async def _check() -> Preflight:
+            # A previous flash broke off in the AppLoader: the app cannot be
+            # reached for a new pre-flight, and its config is still the one
+            # this pre-flight saved and planned for.
+            if stranded := stranded_preflight(self.hass, self.config_entry):
+                return stranded
             release = await async_find_release(self.hass, self.config_entry)
             return await async_preflight(self.hass, self.config_entry, release)
 

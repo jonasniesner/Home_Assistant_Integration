@@ -31,6 +31,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import slugify
 import homeassistant.util.dt as dt_util
+from homeassistant.util.hass_dict import HassKey
 
 from opendisplay.models.config import GlobalConfig
 from opendisplay.models.enums import ICType
@@ -40,7 +41,7 @@ from opendisplay.panels.migration import plan_migration
 from opendisplay.protocol.config_serializer import serialize_config
 
 from . import OpenDisplayConfigEntry
-from .const import CONF_HOST, DATA_FIRMWARE_UPGRADES
+from .const import CONF_HOST, DATA_FIRMWARE_UPGRADES, DOMAIN
 from .repairs import (
     BACKUP_DIR,
     MigrationFailedError,
@@ -75,6 +76,11 @@ RETURN_DEADLINE_S = 180.0
 RETURN_RETRY_S = 5.0
 
 _GITHUB_RELEASES = "https://api.github.com/repos/{repo}/releases?per_page=20"
+
+# The pre-flight of a flash that broke off after the DFU trigger, per entry id. The
+# unit may now sit in the AppLoader, where the app (and so a new pre-flight) cannot
+# be reached; a retry reuses this and flashes the AppLoader directly. In memory only.
+_STRANDED: HassKey[dict[str, Preflight]] = HassKey(f"{DOMAIN}_firmware_v3_stranded")
 
 
 class UpgradeRefusedError(Exception):
@@ -243,6 +249,14 @@ def plan_for_v3(config: GlobalConfig, database: PanelDatabase) -> MigrationPlan:
         {"major": 3, "minor": 0, "patch": 0, "sha": ""}, config, None
     )
     return plan_migration(config, profile, database)
+
+
+@callback
+def stranded_preflight(
+    hass: HomeAssistant, entry: OpenDisplayConfigEntry
+) -> Preflight | None:
+    """Return the pre-flight of a flash that may have left the unit in the AppLoader."""
+    return hass.data.get(_STRANDED, {}).get(entry.entry_id)
 
 
 async def async_preflight(
@@ -429,6 +443,8 @@ def async_start_upgrade(
             try:
                 await async_flash(hass, entry, preflight, on_progress)
             except (UpgradeRefusedError, HomeAssistantError) as err:
+                if isinstance(err, OTAFlashError) and err.reached_apploader:
+                    hass.data.setdefault(_STRANDED, {})[entry.entry_id] = preflight
                 _LOGGER.error(
                     "%s: firmware 3.x upgrade failed before or during the flash: %s "
                     "(2.x config backup: %s)",
@@ -438,6 +454,7 @@ def async_start_upgrade(
                 )
                 raise
             flashed.set()
+            hass.data.get(_STRANDED, {}).pop(entry.entry_id, None)
             try:
                 await async_finish(hass, entry, preflight)
             except UpgradeRefusedError as err:
